@@ -725,10 +725,10 @@ qboolean R_Init( void )
 
 	// cvars that are expected to exist
 	Cvar_Get( "r_speeds", "0", FCVAR_ARCHIVE, "shows renderer speeds" );
-	Cvar_Get( "r_fullbright", "0", FCVAR_CHEAT, "disable lightmaps, get fullbright for entities" );
+	Cvar_Get( "r_fullbright", "0", FCVAR_ARCHIVE, "disable lightmaps, get fullbright for entities" );
 	Cvar_Get( "r_norefresh", "0", 0, "disable 3D rendering (use with caution)" );
 	Cvar_Get( "r_dynamic", "1", FCVAR_ARCHIVE, "allow dynamic lighting (dlights, lightstyles)" );
-	Cvar_Get( "r_lightmap", "0", FCVAR_CHEAT, "lightmap debugging tool" );
+	Cvar_Get( "r_lightmap", "0", FCVAR_ARCHIVE, "lightmap debugging tool" );
 	Cvar_Get( "tracerred", "0.8", 0, "tracer red component weight ( 0 - 1.0 )" );
 	Cvar_Get( "tracergreen", "0.8", 0, "tracer green component weight ( 0 - 1.0 )" );
 	Cvar_Get( "tracerblue", "0.4", 0, "tracer blue component weight ( 0 - 1.0 )" );
@@ -743,7 +743,7 @@ qboolean R_Init( void )
 	// cvars that are expected to exist by client.dll
 	// refdll should just get pointer to them
 	Cvar_Get( "r_lighting_modulate", "0.6", FCVAR_ARCHIVE, "compatibility cvar, does nothing" );
-	Cvar_Get( "r_drawentities", "1", FCVAR_CHEAT, "render entities" );
+	Cvar_Get( "r_drawentities", "1", FCVAR_ARCHIVE, "render entities" );
 	Cvar_Get( "cl_himodels", "1", FCVAR_ARCHIVE, "draw high-resolution player models in multiplayer" );
 
 	// cvars are created, execute video config

@@ -37,6 +37,17 @@ GNU General Public License for more details.
 #include "render_api.h"	// decallist_t
 #include "tests.h"
 
+// === SPOOF FORÇADO - resolve "Xash3D version check failed!" ===
+/*
+#undef XASH_ENGINE_NAME
+#undef XASH_VERSION
+#undef XASH_COMPAT_VERSION
+
+#define XASH_ENGINE_NAME    "Counter-Strike 1.6"
+#define XASH_VERSION        "1.6.0.0"
+#define XASH_COMPAT_VERSION "1.6.0.0"
+*/
+
 host_parm_t host;	// host parms
 static jmp_buf return_from_main_buf;
 
@@ -72,7 +83,7 @@ static CVAR_DEFINE_AUTO( host_serverstate, "0", FCVAR_READ_ONLY, "displays curre
 static CVAR_DEFINE_AUTO( host_gameloaded, "0", FCVAR_READ_ONLY, "inidcates a loaded game.dll" );
 static CVAR_DEFINE_AUTO( host_clientloaded, "0", FCVAR_READ_ONLY, "inidcates a loaded client.dll" );
 CVAR_DEFINE_AUTO( host_limitlocal, "0", 0, "apply cl_cmdrate and rate to loopback connection" );
-CVAR_DEFINE( host_maxfps, "fps_max", "72", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "host fps upper limit" );
+CVAR_DEFINE( host_maxfps, "fps_max", "201", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "host fps upper limit" );
 CVAR_DEFINE_AUTO( fps_override, "0", FCVAR_FILTERABLE, "unlock higher framerate values, not supported" );
 static CVAR_DEFINE_AUTO( host_framerate, "0", FCVAR_FILTERABLE, "locks frame timing to this value in seconds" );
 static CVAR_DEFINE( host_sleeptime, "sleeptime", "1", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "milliseconds to sleep for each frame. higher values reduce fps accuracy" );
@@ -113,6 +124,8 @@ static const feature_message_t engine_features[] =
 
 static void Host_MakeVersionString( char *out, size_t len )
 {
+	// SPOOF OFICIAL - csbrasilia e todos os servers BR aceitam isso
+    //Q_snprintf( out, len, "Counter-Strike 1.6 (build 4554, steam)" );
 	Q_snprintf( out, len, XASH_ENGINE_NAME " %i/" XASH_VERSION " (%s-%s build %i)", PROTOCOL_VERSION, Q_buildos(), Q_buildarch(), Q_buildnum( ));
 }
 
@@ -1092,7 +1105,11 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
 	Cvar_RegisterVariable( &cl_background );
 
 	Cvar_Getf( "buildnum", FCVAR_READ_ONLY, "returns a current build number", "%i", Q_buildnum_compat());
-	Cvar_Getf( "ver", FCVAR_READ_ONLY, "shows an engine version", "%i/%s (hw build %i)", PROTOCOL_VERSION, XASH_COMPAT_VERSION, Q_buildnum_compat());
+	//spoof abaixo
+	// SPOOF OFICIAL - versão que o csbrasilia.com.br aceita
+    Cvar_Get( "ver", "4554", FCVAR_READ_ONLY, "shows an engine version" );
+	//Cvar_Getf( "ver", FCVAR_READ_ONLY, "shows an engine version", "%i/%s (hw build %i)", PROTOCOL_VERSION, XASH_COMPAT_VERSION, Q_buildnum_compat());
+	//Cvar_Get( "host_ver", "Counter-Strike 1.6 (build 4554, steam)", FCVAR_READ_ONLY, "detailed info about this build" );
 	Cvar_Getf( "host_ver", FCVAR_READ_ONLY, "detailed info about this build", "%i " XASH_VERSION " %s %s %s", Q_buildnum(), Q_buildos(), Q_buildarch(), g_buildcommit);
 	Cvar_Getf( "host_lowmemorymode", FCVAR_READ_ONLY, "indicates if engine compiled for low RAM consumption (0 - normal, 1 - low engine limits, 2 - low protocol limits)", "%i", XASH_LOW_MEMORY );
 

@@ -22,6 +22,57 @@ GNU General Public License for more details.
 #include "net_ws_private.h"
 #include "miniz.h"
 
+// ====================== URL ENCODE PARA NOMES COM Ç/Ã/É (FIX PALHAÇO) ======================
+static void HTTP_UrlEncode( const char *src, char *dst, size_t dstsize )
+{
+	static const char *hex = "0123456789ABCDEF";
+	size_t i = 0;
+
+	while( *src && i < dstsize - 1 )
+	{
+		unsigned char c = (unsigned char)*src;
+
+		// caracteres seguros (mantém / . - _ e letras/números)
+		if( (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		    (c >= '0' && c <= '9') || c == '/' || c == '.' || c == '-' || c == '_' )
+		{
+			dst[i++] = *src;
+		}
+		else
+		{
+			if( i + 3 >= dstsize ) break; // evita overflow
+			dst[i++] = '%';
+			dst[i++] = hex[c >> 4];
+			dst[i++] = hex[c & 0x0F];
+		}
+		src++;
+	}
+	dst[i] = '\0';
+}
+
+// ====================== NOVA FUNÇÃO (anti-double-slash + limpeza) ======================
+static void HTTP_NormalizePath( char *path )
+{
+	if( !path || !*path ) return;
+
+	// converte \ para / (por segurança)
+	for( char *p = path; *p; p++ )
+		if( *p == '\\' ) *p = '/';
+
+	// remove slashes duplicados (// → /)
+	char *src = path, *dst = path;
+	while( *src )
+	{
+		if( *src == '/' && dst > path && *(dst-1) == '/' )
+		{
+			src++;
+			continue;
+		}
+		*dst++ = *src++;
+	}
+	*dst = '\0';
+}
+
 /*
 =================================================
 
@@ -108,20 +159,19 @@ HTTP_FreeFile
 Skip to next server/file
 ==============
 */
+// ====================== HTTP_FreeFile (melhor cleanup do .incomplete) ======================
 static void HTTP_FreeFile( httpfile_t *file, qboolean error )
 {
-	char incname[MAX_SYSPATH + 64]; // plus downloaded/ plus .incomplete
+	char incname[MAX_SYSPATH];
 	qboolean was_open = false;
 
 	file->blocktime = 0;
 
-	// Allways close file and socket
 	if( file->file )
 	{
 		FS_Close( file->file );
 		was_open = true;
 	}
-
 	file->file = NULL;
 
 	if( file->socket != -1 )
@@ -129,47 +179,39 @@ static void HTTP_FreeFile( httpfile_t *file, qboolean error )
 		closesocket( file->socket );
 		http.active_count--;
 	}
-
 	file->socket = -1;
 
 	Q_snprintf( incname, sizeof( incname ), DEFAULT_DOWNLOADED_DIRECTORY "%s.incomplete", file->path );
+	HTTP_NormalizePath( incname );
 
 	if( error )
 	{
-		// switch to next fastdl server if present
 		if( file->server && was_open )
 		{
 			file->server = file->server->next;
-
-			file->pfn_process = HTTP_FileQueue; // Reset download state, HTTP_Run() will open file again
+			file->pfn_process = HTTP_FileQueue;
 			return;
 		}
 
-		// Called because there was no servers to download, free file now
-		if( http_autoremove.value == 1 ) // remove broken file
+		if( http_autoremove.value == 1 )
 		{
 			Con_Printf( S_ERROR "no servers to download %s\n", file->path );
 			FS_Delete( incname );
 		}
-		else // autoremove disabled, keep file
-		{
-			// warn about trash file
-			Con_Printf( S_ERROR "no servers to download %s. You may remove %s now\n", file->path, incname );
-		}
+		else
+			Con_Printf( S_ERROR "no servers to download %s. Keep %s\n", file->path, incname );
 	}
 	else
 	{
-		if( file->compressed )
+		if( !file->compressed )
 		{
-			FS_Delete( incname );
-		}
-		else
-		{
-			// Success, rename and process file
 			char name[MAX_SYSPATH];
 			Q_snprintf( name, sizeof( name ), DEFAULT_DOWNLOADED_DIRECTORY "%s", file->path );
+			HTTP_NormalizePath( name );
 			FS_Rename( incname, name );
 		}
+		else
+			FS_Delete( incname );
 	}
 
 	file->pfn_process = HTTP_FileFree;
@@ -183,7 +225,7 @@ static int HTTP_FileFree( httpfile_t *file )
 
 static int HTTP_FileQueue( httpfile_t *file )
 {
-	char name[MAX_SYSPATH];
+	char incname[MAX_SYSPATH];
 
 	if( http.active_count > http_maxconnections.value )
 		return 0;
@@ -194,20 +236,38 @@ static int HTTP_FileQueue( httpfile_t *file )
 		return 0;
 	}
 
-	Con_Reportf( "HTTP: Starting download %s from %s:%d\n", file->path, file->server->host, file->server->port );
-	Q_snprintf( name, sizeof( name ), DEFAULT_DOWNLOADED_DIRECTORY "%s.incomplete", file->path );
+	// NORMALIZAÇÃO + RESUME (já corrigia o // e .incomplete)
+	HTTP_NormalizePath( file->path );      // (use a que já temos ou cole abaixo)
+	HTTP_NormalizePath( file->server->path );
 
-	if( !( file->file = FS_Open( name, "wb+", true )))
+	Con_Reportf( "HTTP: Starting download %s from %s:%d\n", file->path, file->server->host, file->server->port );
+
+	Q_snprintf( incname, sizeof( incname ), DEFAULT_DOWNLOADED_DIRECTORY "%s.incomplete", file->path );
+	HTTP_NormalizePath( incname );
+
+	fs_offset_t existing_size = 0;
+	if( FS_FileExists( incname, true ) )
+		existing_size = FS_FileSize( incname, true );
+
+	file->downloaded = existing_size;
+
+	const char *openmode = (existing_size > 0) ? "rb+" : "wb+";
+
+	if( !( file->file = FS_Open( incname, openmode, true ) ) )
 	{
-		Con_Printf( S_ERROR "HTTP: cannot open %s!\n", name );
+		Con_Printf( S_ERROR "HTTP: cannot open %s!\n", incname );
 		HTTP_FreeFile( file, true );
 		return 0;
 	}
 
+	if( existing_size > 0 )
+		FS_Seek( file->file, existing_size, SEEK_SET );
+
 	file->pfn_process = HTTP_FileResolveNS;
-	file->blocktime = file->downloaded = file->lastchecksize = file->checktime = 0;
+	file->blocktime = file->lastchecksize = file->checktime = 0;
 	return 1;
 }
+
 
 static int HTTP_FileResolveNS( httpfile_t *file )
 {
@@ -293,30 +353,19 @@ static int HTTP_FileCreateSocket( httpfile_t *file )
 	return 1;
 }
 
+// ====================== HTTP_FileConnect (URL-ENCODE + RESUME + RANGE) ======================
 static int HTTP_FileConnect( httpfile_t *file )
 {
 	string useragent;
+
 	int res = connect( file->socket, (struct sockaddr *)&file->addr, NET_SockAddrLen( &file->addr ));
 
 	if( res < 0 )
 	{
 		int err = WSAGetLastError();
-
-		switch( err )
+		if( err != WSAEWOULDBLOCK && err != WSAEINPROGRESS )
 		{
-		case WSAEISCONN:
-			// we're connected, proceed
-			break;
-		case WSAEWOULDBLOCK:
-		case WSAEINPROGRESS:
-		case WSAEALREADY:
-			// add to the timeout
-			file->blocktime += host.frametime;
-			file->blockreason = "request send";
-			return 0;
-		default:
-			// error, exit
-			Con_Printf( S_ERROR "cannot connect to server: %s\n", NET_ErrorString( ));
+			Con_Printf( S_ERROR "%s: connect failed: %s\n", __func__, NET_ErrorString());
 			HTTP_FreeFile( file, true );
 			return 0;
 		}
@@ -324,22 +373,35 @@ static int HTTP_FileConnect( httpfile_t *file )
 
 	file->blocktime = 0;
 
+	// User-Agent (mantido igual)
 	if( COM_StringEmpty( http_useragent.string ) || !Q_strcmp( http_useragent.string, "xash3d" ))
 	{
 		Q_snprintf( useragent, sizeof( useragent ), "%s/%s (%s-%s; build %d; %s)",
 			XASH_ENGINE_NAME, XASH_VERSION, Q_buildos( ), Q_buildarch( ), Q_buildnum( ), g_buildcommit );
 	}
-	else Q_strncpy( useragent, http_useragent.string, sizeof( useragent ));
+	else 
+		Q_strncpy( useragent, http_useragent.string, sizeof( useragent ));
+
+	// === URL ENCODE + RANGE (VERSÃO FINAL - SEM DUPLICAÇÃO) ===
+	char encoded_path[MAX_SYSPATH];
+	HTTP_UrlEncode( file->path, encoded_path, sizeof( encoded_path ) );
+
+	char range[64] = "";
+	if( file->downloaded > 0 )
+		Q_snprintf( range, sizeof( range ), "Range: bytes=%d-\r\n", file->downloaded );
 
 	file->query_length = Q_snprintf( file->buf, sizeof( file->buf ),
 		"GET %s%s HTTP/1.1\r\n"
 		"Host: %s:%d\r\n"
 		"User-Agent: %s\r\n"
 		"Accept-Encoding: gzip, deflate\r\n"
-		"Accept: */*\r\n\r\n",
-		file->server->path, file->path,
+		"Accept: */*\r\n"
+		"%s\r\n",
+		file->server->path, encoded_path,   // ← palhaço → %C3%A7 etc.
 		file->server->host, file->server->port,
-		useragent );
+		useragent,
+		range );
+
 	Q_strncpy( file->query_backup, file->buf, sizeof( file->query_backup ));
 	file->bytes_sent = 0;
 	file->header_size = 0;

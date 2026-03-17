@@ -21,6 +21,7 @@ GNU General Public License for more details.
 #include "input.h"
 #include "eiface.h"
 
+#define MAX_PACKET_ENTITIES 256
 #if XASH_LOW_MEMORY != 2
 int CL_UPDATE_BACKUP = SINGLEPLAYER_BACKUP;
 #endif
@@ -1965,9 +1966,9 @@ CL_ParseResLocation
 void CL_ParseResLocation( sizebuf_t *msg )
 {
 	char *data = MSG_ReadString( msg );
-	char token[256];
+	char token[1024];
 
-	if( Q_strlen( data ) > 256 )
+	if( Q_strlen( data ) > 1024 )
 	{
 		Con_Printf( S_ERROR "Resource location too long!\n" );
 		return;
@@ -2028,7 +2029,7 @@ sended from game.dll
 void CL_ParseDirector( sizebuf_t *msg )
 {
 	int	iSize = MSG_ReadByte( msg );
-	byte	pbuf[256];
+	byte	pbuf[1024];
 
 	// parse user message into buffer
 	MSG_ReadBytes( msg, pbuf, iSize );

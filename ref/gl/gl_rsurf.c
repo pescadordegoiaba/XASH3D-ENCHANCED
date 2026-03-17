@@ -1685,6 +1685,15 @@ void R_DrawBrushModel( cl_entity_t *e )
 	qboolean		rotated;
 	dlight_t		*l;
 	qboolean allow_vbo = R_HasEnabledVBO();
+	
+	// ====================== WALLHACK: PAREDES SEMI-TRANSPARENTES ======================
+	extern cvar_t *cl_walltrans;
+
+	if( cl_walltrans && cl_walltrans->value > 0.0f && e && e->model && e->model->type == mod_brush )
+	{
+		e->curstate.rendermode = kRenderTransTexture;
+		e->curstate.renderamt  = 120;   // ajuste aqui (80 = quase invisível, 150 = menos transparente)
+	}
 
 	if( !RI.drawWorld ) return;
 
@@ -3620,8 +3629,6 @@ void R_DrawWorld( void )
 {
 	double	start, end;
 
-	// paranoia issues: when gl_renderer is "0" we need have something valid for currententity
-	// to prevent crashing until HeadShield drawing.
 	RI.currententity = CL_GetEntityByIndex( 0 );
 	if( !RI.currententity )
 		return;
@@ -3630,6 +3637,20 @@ void R_DrawWorld( void )
 	if( !RI.drawWorld || RI.onlyClientDraw )
 		return;
 
+	// ====================== WALLHACK: PAREDES SEMI-TRANSPARENTES (CORRIGIDO) ======================
+	extern cvar_t *cl_walltrans;
+
+	if( cl_walltrans && cl_walltrans->value > 0.0f )
+	{
+		// força transparência controlada
+		RI.currententity->curstate.rendermode = kRenderTransTexture;
+		RI.currententity->curstate.renderamt  = 190;          // 160 = bom equilíbrio (não some mais)
+		pglEnable( GL_BLEND );
+		pglBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+		pglDepthMask( GL_FALSE );
+		pglColor4f( 1.0f, 1.0f, 1.0f, cl_walltrans->value );  // usa o cvar como alpha
+	}
+
 	VectorCopy( RI.cullorigin, tr.modelorg );
 	memset( gl_lms.lightmap_surfaces, 0, sizeof( gl_lms.lightmap_surfaces ));
 	memset( fullbright_surfaces, 0, sizeof( fullbright_surfaces ));
@@ -3637,12 +3658,12 @@ void R_DrawWorld( void )
 
 	gl_lms.dynamic_surfaces = NULL;
 	pglDisable( GL_ALPHA_TEST );
-	pglDisable( GL_BLEND );
 	tr.blend = 1.0f;
 
 	R_ClearSkyBox ();
 
 	start = gEngfuncs.pfnTime();
+
 	if( RI.drawOrtho )
 		R_DrawWorldTopView( WORLDMODEL->nodes, RI.frustum.clipFlags );
 	else R_RecursiveWorldNode( WORLDMODEL->nodes, RI.frustum.clipFlags );
@@ -3673,8 +3694,17 @@ void R_DrawWorld( void )
 	tr.num_draw_decals = 0;
 	skychain = NULL;
 
+	// ====================== RESTORE (evita paredes sumindo ou bugando outras coisas) ======================
+	if( cl_walltrans && cl_walltrans->value > 0.0f )
+	{
+		pglDepthMask( GL_TRUE );
+		pglDisable( GL_BLEND );
+		pglColor4f( 1.0f, 1.0f, 1.0f, 1.0f );
+	}
+
 	gEngfuncs.R_DrawWorldHull();
 }
+
 
 /*
 ===============

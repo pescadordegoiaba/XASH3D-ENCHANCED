@@ -58,6 +58,12 @@ static int			cache_current;
 static int			cache_current_hull;
 static int			cache_current_plane;
 
+
+
+
+// cvar hitbox expander
+convar_t	*cl_hitbox_expand = NULL;
+
 /*
 ====================
 Mod_InitStudioHull
@@ -220,6 +226,15 @@ static void Mod_SetStudioHullPlane( int planenum, int bone, int axis, float offs
 	if( planenum & 1 ) pl->dist -= DotProductFabs( pl->normal, size );
 	else pl->dist += DotProductFabs( pl->normal, size );
 
+		// Expande o hitbox se o cvar estiver ativo
+	if (cl_hitbox_expand && cl_hitbox_expand->value > 0.0f)
+	{
+		if (planenum & 1)	// planos MIN (bbmin) - empurra para fora
+			pl->dist -= cl_hitbox_expand->value;
+		else					// planos MAX (bbmax) - empurra para fora
+			pl->dist += cl_hitbox_expand->value;
+	}
+
 }
 
 /*
@@ -268,6 +283,10 @@ hull_t *Mod_HullForStudio( model_t *model, float frame, int sequence, vec3_t ang
 
 	if( SV_IsValidEdict( pEdict ) && pEdict->v.gamestate == 1 )
 		bSkipShield = 1;
+
+		// === EXPANSÃO MANUAL DE HITBOX (seu patch) ===
+	if (!cl_hitbox_expand)
+		cl_hitbox_expand = Cvar_Get("cl_hitbox_expand", "0", FCVAR_ARCHIVE, "Expand player hitboxes (client-side only)");
 
 	for( i = j = 0; i < mod_studiohdr->numhitboxes; i++, j += 6 )
 	{

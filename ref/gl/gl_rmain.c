@@ -19,11 +19,14 @@ GNU General Public License for more details.
 #include "beamdef.h"
 #include "entity_types.h"
 
-
+#define MAX_PACKET_ENTITIES 1024
 #define IsLiquidContents( cnt )	( cnt == CONTENTS_WATER || cnt == CONTENTS_SLIME || cnt == CONTENTS_LAVA )
 
 float		gldepthmin, gldepthmax;
 ref_instance_t	RI;
+
+cvar_t *cl_walltrans = NULL;
+cvar_t *cl_chams_ignore_depth = NULL;
 
 static int R_RankForRenderMode( int rendermode )
 {
@@ -844,30 +847,48 @@ static void R_DrawEntitiesOnList( void )
 	tr.blend = 1.0f;
 	GL_CheckForErrors();
 
-	// first draw solid entities
-	for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
-	{
-		RI.currententity = tr.draw_list->solid_entities[i];
-		RI.currentmodel = RI.currententity->model;
+// first draw solid entities
+for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
+{
+    RI.currententity = tr.draw_list->solid_entities[i];
+    RI.currentmodel = RI.currententity->model;
 
-		Assert( RI.currententity != NULL );
-		Assert( RI.currentmodel != NULL );
+    Assert( RI.currententity != NULL );
+    Assert( RI.currentmodel != NULL );
 
-		switch( RI.currentmodel->type )
-		{
-		case mod_brush:
-			R_DrawBrushModel( RI.currententity );
-			break;
-		case mod_alias:
-			R_DrawAliasModel( RI.currententity );
-			break;
-		case mod_studio:
-			R_DrawStudioModel( RI.currententity );
-			break;
-		default:
-			break;
-		}
-	}
+    // ====================== CHAMS WALLHACK PURO (desativa depth só no boneco inimigo) ======================
+    qboolean chams_ignore = (cl_chams_ignore_depth && cl_chams_ignore_depth->value > 0.0f &&
+                             RI.currententity->player);
+
+    if( chams_ignore )
+    {
+        pglDisable( GL_DEPTH_TEST );
+        pglDepthMask( GL_FALSE );
+        pglDepthFunc( GL_ALWAYS );
+    }
+
+    switch( RI.currentmodel->type )
+    {
+    case mod_brush:
+        R_DrawBrushModel( RI.currententity );
+        break;
+    case mod_alias:
+        R_DrawAliasModel( RI.currententity );
+        break;
+    case mod_studio:
+        R_DrawStudioModel( RI.currententity );
+        break;
+    default:
+        break;
+    }
+
+    if( chams_ignore )
+    {
+        pglEnable( GL_DEPTH_TEST );
+        pglDepthMask( GL_TRUE );
+        pglDepthFunc( GL_LEQUAL );
+    }
+}
 
 	GL_CheckForErrors();
 
@@ -1070,7 +1091,29 @@ R_BeginFrame
 */
 void R_BeginFrame( qboolean clearScene )
 {
-	glConfig.softwareGammaUpdate = false;	// in case of possible fails
+	// ====================== REGISTRO DO CVAR WALLHACK ======================
+// ====================== REGISTRO DOS CVARS WALLHACK/CHAMS ======================
+    if( !cl_walltrans )
+     cl_walltrans = gEngfuncs.Cvar_Get( "cl_walltrans", "0", 0, "wall transparency for chams wallhack" );
+
+    if( !cl_chams_ignore_depth )
+     cl_chams_ignore_depth = gEngfuncs.Cvar_Get( "cl_chams_ignore_depth", "0", 0, "ignore depth test for chams players" );
+
+	// ====================== FORÇA VBO OFF (OBRIGATÓRIO) ======================
+	extern void R_EnableVBO( qboolean enable );   // ← função do ref_gl
+
+	if( cl_walltrans && cl_walltrans->value > 0.0f )
+	{
+		//gEngfuncs.Cvar_SetValue( "r_vbo", 0.0f );
+		R_EnableVBO( false );   // desativa imediatamente (legacy path ativado)
+	}
+	else
+	{
+		// opcional: volta VBO se você quiser (comente se preferir deixar r_vbo manual)
+		// R_EnableVBO( true );
+	}
+
+	glConfig.softwareGammaUpdate = false;
 
 	if(( gl_clear->value || ENGINE_GET_PARM( PARM_DEV_OVERVIEW )) &&
 		clearScene && ENGINE_GET_PARM( PARM_CONNSTATE ) != ca_cinematic )
@@ -1082,10 +1125,8 @@ void R_BeginFrame( qboolean clearScene )
 
 	R_Set2DMode( true );
 
-	// draw buffer stuff
 	pglDrawBuffer( GL_BACK );
 
-	// update texture parameters
 	if( FBitSet( gl_texture_nearest.flags|gl_lightmap_nearest.flags|gl_texture_anisotropy.flags|gl_texture_lodbias.flags, FCVAR_CHANGED ))
 		R_SetTextureParameters();
 
