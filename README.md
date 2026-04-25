@@ -100,7 +100,7 @@ This repository contains our fork of HLSDK and restored source code for Half-Lif
 
 * Clone this repostory: `$ git clone --recursive https://github.com/FWGS/xash3d-fwgs`.
 
-#### iOS/iPadOS
+#### iOS/iPadOS🏳️‍🌈
 * Install Xcode from the appstore.
 * Install [Homebrew package manager](https://brew.sh).
 
