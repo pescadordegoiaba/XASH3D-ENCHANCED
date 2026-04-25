@@ -38,10 +38,12 @@ typedef struct
 	int first, last;
 } separate_pass_t;
 
-static separate_pass_t draw_wateralpha = { 0, -1 };
-static separate_pass_t draw_alpha_surfaces = { 0, -1 };
-static separate_pass_t draw_fullbrights = { 0, -1 };
-static separate_pass_t draw_details = { 0, -1 };
+#define SEPARATE_PASS_EMPTY_FIRST INT_MAX
+
+static separate_pass_t draw_wateralpha = { SEPARATE_PASS_EMPTY_FIRST, -1 };
+static separate_pass_t draw_alpha_surfaces = { SEPARATE_PASS_EMPTY_FIRST, -1 };
+static separate_pass_t draw_fullbrights = { SEPARATE_PASS_EMPTY_FIRST, -1 };
+static separate_pass_t draw_details = { SEPARATE_PASS_EMPTY_FIRST, -1 };
 static msurface_t		*skychain = NULL;
 static gllightmapstate_t	gl_lms;
 
@@ -60,6 +62,7 @@ static inline void R_AddToSeparatePass( separate_pass_t *sp, int num )
 
 static inline void R_ResetSeparatePass( separate_pass_t *sp )
 {
+	sp->first = SEPARATE_PASS_EMPTY_FIRST;
 	sp->last = -1;
 }
 
@@ -660,9 +663,13 @@ static int LM_AllocBlock( int w, int h, int *x, int *y )
 	int	i, j;
 	int	best, best2;
 
-	best = BLOCK_SIZE;
+	if( w <= 0 || h <= 0 || w > BLOCK_SIZE || h > BLOCK_SIZE || !x || !y )
+		return false;
 
-	for( i = 0; i < BLOCK_SIZE - w; i++ )
+	best = BLOCK_SIZE;
+	*x = *y = 0;
+
+	for( i = 0; i <= BLOCK_SIZE - w; i++ )
 	{
 		best2 = 0;
 
@@ -700,6 +707,9 @@ static void LM_UploadDynamicBlock( void )
 		if( gl_lms.allocated[i] > height )
 			height = gl_lms.allocated[i];
 	}
+
+	if( height <= 0 )
+		return;
 
 	pglTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, BLOCK_SIZE, height, GL_RGBA, GL_UNSIGNED_BYTE, gl_lms.lightmap_buffer );
 }
@@ -742,6 +752,44 @@ Combine and scale multiple lightmaps into the floating
 format in r_blocklights
 =================
 */
+/*
+=================
+R_LightmapScale
+
+Caches the most common light scale calculation. R_BuildLightMap can be called
+many times per frame for dynamic lightmaps, so avoid repeating powf() unless
+one of the dependent render cvars changes.
+=================
+*/
+static int R_LightmapScale( void )
+{
+	static float cached_gamma = -1.0f;
+	static int cached_overbright = -1;
+	static int cached_vbo = -1;
+	static int cached_vbo_overbright = -1;
+	static int cached_scale = 256;
+
+	const int overbright = gl_overbright.value ? 1 : 0;
+	const int vbo = R_HasEnabledVBO() ? 1 : 0;
+	const int vbo_overbright = r_vbo_overbrightmode.value ? 1 : 0;
+	const float gamma = ( v_lightgamma->value > 0.0f ) ? v_lightgamma->value : 1.0f;
+
+	if( cached_gamma == gamma && cached_overbright == overbright &&
+		cached_vbo == vbo && cached_vbo_overbright == vbo_overbright )
+		return cached_scale;
+
+	cached_gamma = gamma;
+	cached_overbright = overbright;
+	cached_vbo = vbo;
+	cached_vbo_overbright = vbo_overbright;
+
+	if( overbright )
+		cached_scale = ( vbo && !vbo_overbright ) ? 171 : 256;
+	else cached_scale = (int)( pow( 2.0f, 1.0f / gamma ) * 256.0f + 0.5f );
+
+	return cached_scale;
+}
+
 static void R_BuildLightMap( const msurface_t *surf, byte *dest, int stride, qboolean dynamic )
 {
 	int map, t;
@@ -753,9 +801,7 @@ static void R_BuildLightMap( const msurface_t *surf, byte *dest, int stride, qbo
 	const int tmax = ( info->lightextents[1] / sample_size ) + 1;
 	const int size = smax * tmax;
 
-	if( gl_overbright.value )
-		lightscale = ( R_HasEnabledVBO() && !r_vbo_overbrightmode.value) ? 171 : 256;
-	else lightscale = ( pow( 2.0f, 1.0f / v_lightgamma->value ) * 256 ) + 0.5;
+	lightscale = R_LightmapScale();
 
 	memset( r_blocklights, 0, sizeof( uint ) * size * 3 );
 
@@ -795,12 +841,12 @@ static void R_BuildLightMap( const msurface_t *surf, byte *dest, int stride, qbo
 
 			for( i = 0; i < 3; i++ )
 			{
-				int t = bl[i] * lightscale >> 14;
+				int value = bl[i] * lightscale >> 14;
 
-				if( t > 1023 )
-					t = 1023;
+				if( value > 1023 )
+					value = 1023;
 
-				dst[i] = LightToTexGamma( t ) >> 2;
+				dst[i] = LightToTexGamma( value ) >> 2;
 			}
 			dst[3] = 255;
 		}
@@ -885,7 +931,6 @@ static void DrawGLPoly( glpoly2_t *p, float xScale, float yScale )
 	{
 		const cl_entity_t *e = RI.currententity;
 		float flConveyorSpeed;
-		float flRate, flAngle, sy, cy;
 		gl_texture_t *texture;
 
 		if( e == CL_GetEntityByIndex( 0 ) && ENGINE_GET_PARM( PARM_QUAKE_COMPATIBLE ))
@@ -900,20 +945,15 @@ static void DrawGLPoly( glpoly2_t *p, float xScale, float yScale )
 		}
 		texture = R_GetTexture( glState.currentTexturesIndex[glState.activeTMU] );
 
-		flRate = fabs( flConveyorSpeed ) / (float)texture->srcWidth;
-		flAngle = ( flConveyorSpeed >= 0 ) ? 180 : 0;
+		// Original code used SinCos(0/180) to produce horizontal scrolling only.
+		// This is equivalent and avoids trig work for every conveyor polygon.
+		if( texture && texture->srcWidth > 0 )
+			sOffset = fmod( -gp_cl->time * flConveyorSpeed / (float)texture->srcWidth, 1.0f );
+		else sOffset = 0.0f;
 
-		SinCos( flAngle * ( M_PI_F / 180.0f ), &sy, &cy );
-		sOffset = gp_cl->time * cy * flRate;
-		tOffset = gp_cl->time * sy * flRate;
-
-		// make sure that we are positive
-		if( sOffset < 0.0f ) sOffset += 1.0f + -(int)sOffset;
-		if( tOffset < 0.0f ) tOffset += 1.0f + -(int)tOffset;
-
-		// make sure that we are in a [0,1] range
-		sOffset = sOffset - (int)sOffset;
-		tOffset = tOffset - (int)tOffset;
+		if( sOffset < 0.0f )
+			sOffset += 1.0f;
+		tOffset = 0.0f;
 	}
 	else
 	{
@@ -1685,15 +1725,6 @@ void R_DrawBrushModel( cl_entity_t *e )
 	qboolean		rotated;
 	dlight_t		*l;
 	qboolean allow_vbo = R_HasEnabledVBO();
-	
-	// ====================== WALLHACK: PAREDES SEMI-TRANSPARENTES ======================
-	extern cvar_t *cl_walltrans;
-
-	if( cl_walltrans && cl_walltrans->value > 0.0f && e && e->model && e->model->type == mod_brush )
-	{
-		e->curstate.rendermode = kRenderTransTexture;
-		e->curstate.renderamt  = 120;   // ajuste aqui (80 = quase invisível, 150 = menos transparente)
-	}
 
 	if( !RI.drawWorld ) return;
 
@@ -3637,20 +3668,6 @@ void R_DrawWorld( void )
 	if( !RI.drawWorld || RI.onlyClientDraw )
 		return;
 
-	// ====================== WALLHACK: PAREDES SEMI-TRANSPARENTES (CORRIGIDO) ======================
-	extern cvar_t *cl_walltrans;
-
-	if( cl_walltrans && cl_walltrans->value > 0.0f )
-	{
-		// força transparência controlada
-		RI.currententity->curstate.rendermode = kRenderTransTexture;
-		RI.currententity->curstate.renderamt  = 190;          // 160 = bom equilíbrio (não some mais)
-		pglEnable( GL_BLEND );
-		pglBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
-		pglDepthMask( GL_FALSE );
-		pglColor4f( 1.0f, 1.0f, 1.0f, cl_walltrans->value );  // usa o cvar como alpha
-	}
-
 	VectorCopy( RI.cullorigin, tr.modelorg );
 	memset( gl_lms.lightmap_surfaces, 0, sizeof( gl_lms.lightmap_surfaces ));
 	memset( fullbright_surfaces, 0, sizeof( fullbright_surfaces ));
@@ -3693,14 +3710,6 @@ void R_DrawWorld( void )
 	r_stats.t_world_draw = end - start;
 	tr.num_draw_decals = 0;
 	skychain = NULL;
-
-	// ====================== RESTORE (evita paredes sumindo ou bugando outras coisas) ======================
-	if( cl_walltrans && cl_walltrans->value > 0.0f )
-	{
-		pglDepthMask( GL_TRUE );
-		pglDisable( GL_BLEND );
-		pglColor4f( 1.0f, 1.0f, 1.0f, 1.0f );
-	}
 
 	gEngfuncs.R_DrawWorldHull();
 }

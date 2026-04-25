@@ -18,7 +18,7 @@ GNU General Public License for more details.
 #include "wadfile.h"
 
 #define SKYCLOUDS_QUALITY	12
-#define MAX_CLIP_VERTS	128 // skybox clip vertices
+#define MAX_CLIP_VERTS	512 // skybox clip vertices
 #define TURBSCALE		( 256.0f / ( M_PI2 ))
 
 static const int r_skyTexOrder[SKYBOX_MAX_SIDES] = { 0, 2, 1, 3, 4, 5 };

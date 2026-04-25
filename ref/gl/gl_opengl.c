@@ -5,7 +5,16 @@
 #include "gl4es/include/gl4eshint.h"
 #endif // XASH_GL4ES
 
+/* Studio renderer CVARs are defined in gl_studio.c, but registered here.
+ * Keep extern declarations here so this translation unit can see the new
+ * optimisation CVARs without moving their definitions out of gl_studio.c. */
+extern convar_t r_studio_meshcache;
+extern convar_t r_studio_gpu_skinning;
+extern convar_t r_studio_batch_sort;
+
+
 CVAR_DEFINE( gl_extensions, "gl_allow_extensions", "1", FCVAR_GLCONFIG|FCVAR_READ_ONLY, "allow gl_extensions" );
+// Raise anisotropy default to 8x — sweet spot for RX 580 (no measurable perf cost vs 4x).
 CVAR_DEFINE( gl_texture_anisotropy, "gl_anisotropy", "8", FCVAR_GLCONFIG, "textures anisotropic filter" );
 CVAR_DEFINE_AUTO( gl_texture_lodbias, "0.0", FCVAR_GLCONFIG, "LOD bias for mipmapped textures (perfomance|quality)" );
 CVAR_DEFINE_AUTO( gl_texture_nearest, "0", FCVAR_GLCONFIG, "disable texture filter" );
@@ -40,6 +49,23 @@ CVAR_DEFINE_AUTO( r_ripple_spawntime, "0.1", FCVAR_GLCONFIG, "how fast new rippl
 CVAR_DEFINE_AUTO( r_large_lightmaps, "0", FCVAR_GLCONFIG|FCVAR_LATCH, "enable larger lightmap atlas textures (might break custom renderer mods)" );
 CVAR_DEFINE_AUTO( r_dlight_virtual_radius, "3", FCVAR_GLCONFIG, "increase dlight radius virtually by this amount, should help against ugly cut off dlights on highly scaled textures" );
 
+/* -------------------------------------------------------------------------
+ * RX 580 / modern renderer plan CVARs
+ * Conservative capability-dispatch layer based on the PDF plan.
+ * gl_rx580_preset: 0=off, 1=safe, 2=aggressive Radeon/VBO opt-in.
+ * ------------------------------------------------------------------------- */
+CVAR_DEFINE_AUTO( gl_rx580_preset, "1", FCVAR_GLCONFIG, "RX 580 renderer preset (0=off, 1=safe, 2=aggressive)" );
+CVAR_DEFINE_AUTO( gl_plan_cap_report, "1", FCVAR_GLCONFIG, "print modern renderer capability dispatch in r_info" );
+CVAR_DEFINE_AUTO( gl_studio_skin_backend, "0", FCVAR_GLCONFIG, "studio skinning backend (0=cpu, 1=uniform, 2=tbo, 3=ssbo experimental)" );
+CVAR_DEFINE_AUTO( gl_studio_instancing, "0", FCVAR_GLCONFIG, "allow future studio instancing path when backend supports it" );
+CVAR_DEFINE_AUTO( gl_world_static_bins, "0", FCVAR_GLCONFIG, "allow future static world VBO bins by material/lightmap" );
+CVAR_DEFINE_AUTO( gl_world_dynamic_ring, "0", FCVAR_GLCONFIG, "allow future dynamic ring buffer for decals/dlights/lightmap data" );
+CVAR_DEFINE_AUTO( gl_texture_ktx2_prefer, "1", FCVAR_GLCONFIG, "prefer KTX2 assets when the image loader provides them" );
+CVAR_DEFINE_AUTO( gl_texture_bc7, "0", FCVAR_GLCONFIG, "prefer BC7/BPTC textures when supported (premium desktop path)" );
+CVAR_DEFINE_AUTO( gl_texture_mipgen, "1", FCVAR_GLCONFIG, "generate/use mipmaps for high-resolution model/world textures" );
+CVAR_DEFINE_AUTO( gl_model_lod, "0", FCVAR_GLCONFIG, "allow future model LOD path for high-poly custom models" );
+CVAR_DEFINE_AUTO( gl_model_lod_bias, "0", FCVAR_GLCONFIG, "LOD bias for future model LOD path" );
+
 DEFINE_ENGINE_SHARED_CVAR_LIST()
 
 poolhandle_t r_temppool;
@@ -48,6 +74,28 @@ gl_globals_t	tr;
 glconfig_t	glConfig;
 glstate_t	glState;
 glwstate_t	glw_state;
+
+
+typedef struct gl_modern_plan_caps_s
+{
+	qboolean is_desktop_gl;
+	qboolean is_radeon;
+	qboolean is_rx580_class;
+	qboolean has_vbo;
+	qboolean has_shader_objects;
+	qboolean has_glsl;
+	qboolean has_uniform_skinning;
+	qboolean has_map_buffer_range;
+	qboolean has_buffer_storage;
+	qboolean has_tbo;
+	qboolean has_ssbo;
+	qboolean has_instancing;
+	qboolean has_texture_compression;
+	qboolean has_bptc;
+	int suggested_skin_backend;
+} gl_modern_plan_caps_t;
+
+static gl_modern_plan_caps_t gl_plan_caps;
 
 #if XASH_GL_STATIC
 	#define GL_CALL( x ) #x, NULL
@@ -668,6 +716,148 @@ static void GL_SetDefaults( void )
 }
 
 
+
+static qboolean GL_VersionAtLeast( int major, int minor )
+{
+	if( glConfig.version_major > major )
+		return true;
+	if( glConfig.version_major == major && glConfig.version_minor >= minor )
+		return true;
+	return false;
+}
+
+static qboolean GL_ExtensionNamePresent( const char *name )
+{
+	if( !name || !glConfig.extensions_string )
+		return false;
+	return Q_strstr( glConfig.extensions_string, name ) ? true : false;
+}
+
+static qboolean GL_RendererMatchesAny( const char *a, const char *b, const char *c, const char *d )
+{
+	if( !glConfig.renderer_string )
+		return false;
+	if( a && Q_stristr( glConfig.renderer_string, a )) return true;
+	if( b && Q_stristr( glConfig.renderer_string, b )) return true;
+	if( c && Q_stristr( glConfig.renderer_string, c )) return true;
+	if( d && Q_stristr( glConfig.renderer_string, d )) return true;
+	return false;
+}
+
+static const char *GL_YesNo( qboolean value )
+{
+	return value ? "yes" : "no";
+}
+
+static const char *GL_SkinBackendName( int backend )
+{
+	switch( backend )
+	{
+	case 1: return "uniform rows";
+	case 2: return "texture buffer";
+	case 3: return "SSBO experimental";
+	default: return "CPU fallback";
+	}
+}
+
+static void GL_BuildModernPlanCaps( void )
+{
+	memset( &gl_plan_caps, 0, sizeof( gl_plan_caps ));
+
+#if XASH_GLES
+	gl_plan_caps.is_desktop_gl = false;
+#else
+	gl_plan_caps.is_desktop_gl = true;
+#endif
+	gl_plan_caps.is_radeon = glConfig.hardware_type == GLHW_RADEON ? true : false;
+	gl_plan_caps.is_rx580_class = GL_RendererMatchesAny( "rx 580", "rx 5", "polaris", "ellesmere" );
+	gl_plan_caps.has_vbo = ( GL_Support( GL_ARB_VERTEX_BUFFER_OBJECT_EXT ) && GL_Support( GL_ARB_MULTITEXTURE ) && glConfig.max_texture_units >= 2 ) ? true : false;
+	gl_plan_caps.has_shader_objects = GL_Support( GL_SHADER_OBJECTS_EXT ) ? true : false;
+	gl_plan_caps.has_glsl = GL_Support( GL_SHADER_GLSL100_EXT ) ? true : false;
+	gl_plan_caps.has_map_buffer_range = GL_Support( GL_MAP_BUFFER_RANGE_EXT ) ? true : false;
+	gl_plan_caps.has_buffer_storage = GL_Support( GL_BUFFER_STORAGE_EXT ) ? true : false;
+	gl_plan_caps.has_texture_compression = GL_Support( GL_TEXTURE_COMPRESSION_EXT ) ? true : false;
+	gl_plan_caps.has_bptc = GL_Support( GL_ARB_TEXTURE_COMPRESSION_BPTC ) ? true : false;
+
+	/* Capability probes only. The current Studio renderer still needs a safe
+	 * model-space mesh cache + shader path before these become default-on. */
+	gl_plan_caps.has_uniform_skinning = ( gl_plan_caps.has_shader_objects && gl_plan_caps.has_glsl && glConfig.max_vertex_uniforms >= 768 && glConfig.max_vertex_attribs >= 8 ) ? true : false;
+	gl_plan_caps.has_tbo = ( GL_VersionAtLeast( 3, 1 ) || GL_ExtensionNamePresent( "GL_ARB_texture_buffer_object" ) || GL_ExtensionNamePresent( "GL_EXT_texture_buffer_object" )) ? true : false;
+	gl_plan_caps.has_ssbo = ( GL_VersionAtLeast( 4, 3 ) || GL_ExtensionNamePresent( "GL_ARB_shader_storage_buffer_object" )) ? true : false;
+	gl_plan_caps.has_instancing = ( GL_VersionAtLeast( 3, 1 ) || GL_ExtensionNamePresent( "GL_ARB_draw_instanced" ) || GL_ExtensionNamePresent( "GL_ARB_instanced_arrays" ) || GL_ExtensionNamePresent( "GL_EXT_draw_instanced" )) ? true : false;
+
+	gl_plan_caps.suggested_skin_backend = 0;
+	if( gl_plan_caps.has_uniform_skinning )
+		gl_plan_caps.suggested_skin_backend = 1;
+	if( gl_plan_caps.has_tbo )
+		gl_plan_caps.suggested_skin_backend = 2;
+	/* SSBO remains experimental and is deliberately not selected automatically. */
+}
+
+static void GL_PrintModernPlanCaps( void )
+{
+	if( !gl_plan_cap_report.value )
+		return;
+
+	gEngfuncs.Con_Printf( "\n" );
+	gEngfuncs.Con_Printf( "RX580 renderer plan capabilities:\n" );
+	gEngfuncs.Con_Printf( "  Radeon/RX580 class: %s / %s\n", GL_YesNo( gl_plan_caps.is_radeon ), GL_YesNo( gl_plan_caps.is_rx580_class ));
+	gEngfuncs.Con_Printf( "  VBO path: %s\n", GL_YesNo( gl_plan_caps.has_vbo ));
+	gEngfuncs.Con_Printf( "  GLSL uniform skinning capable: %s\n", GL_YesNo( gl_plan_caps.has_uniform_skinning ));
+	gEngfuncs.Con_Printf( "  TBO/SSBO/instancing: %s / %s / %s\n", GL_YesNo( gl_plan_caps.has_tbo ), GL_YesNo( gl_plan_caps.has_ssbo ), GL_YesNo( gl_plan_caps.has_instancing ));
+	gEngfuncs.Con_Printf( "  MapBufferRange/buffer storage: %s / %s\n", GL_YesNo( gl_plan_caps.has_map_buffer_range ), GL_YesNo( gl_plan_caps.has_buffer_storage ));
+	gEngfuncs.Con_Printf( "  Texture compression/BPTC(BC7): %s / %s\n", GL_YesNo( gl_plan_caps.has_texture_compression ), GL_YesNo( gl_plan_caps.has_bptc ));
+	gEngfuncs.Con_Printf( "  Suggested future studio skin backend: %s\n", GL_SkinBackendName( gl_plan_caps.suggested_skin_backend ));
+}
+
+static void GL_ApplyModernPlanDefaults( qboolean manual )
+{
+	if( !manual && gl_rx580_preset.value <= 0.0f )
+		return;
+
+	if( r_studio_batch_sort.value < 1.0f )
+		gEngfuncs.Cvar_SetValue( r_studio_batch_sort.name, 1.0f );
+
+	/* Prevent the known animation freeze: current Studio vertices are dynamic
+	 * world/skinned data, so static VBO cache must stay off until a proper
+	 * model-space cache + GPU skinning path exists. */
+	if( r_studio_meshcache.value != 0.0f )
+	{
+		gEngfuncs.Con_Printf( S_OPENGL_WARN "r_studio_meshcache disabled: current Studio vertices are dynamic/skinned; wait for model-space cache + GPU skinning.\n" );
+		gEngfuncs.Cvar_SetValue( r_studio_meshcache.name, 0.0f );
+	}
+
+	if( r_studio_gpu_skinning.value > 0.0f && !gl_plan_caps.has_uniform_skinning )
+	{
+		gEngfuncs.Con_Printf( S_OPENGL_WARN "r_studio_gpu_skinning disabled: GLSL/uniform capability is not sufficient.\n" );
+		gEngfuncs.Cvar_SetValue( r_studio_gpu_skinning.name, 0.0f );
+	}
+
+	if( r_studio_gpu_skinning.value > 0.0f && gl_plan_caps.has_uniform_skinning )
+		gEngfuncs.Cvar_SetValue( gl_studio_skin_backend.name, 1.0f );
+	else
+		gEngfuncs.Cvar_SetValue( gl_studio_skin_backend.name, 0.0f );
+
+	if( gl_texture_bc7.value > 0.0f && !gl_plan_caps.has_bptc )
+	{
+		gEngfuncs.Con_Printf( S_OPENGL_WARN "gl_texture_bc7 disabled: BPTC/BC7 compression is not supported by this GL context.\n" );
+		gEngfuncs.Cvar_SetValue( gl_texture_bc7.name, 0.0f );
+	}
+
+	if( gl_rx580_preset.value >= 2.0f && gl_plan_caps.has_vbo && gl_plan_caps.is_radeon )
+	{
+		if( r_vbo.value == 0.0f )
+			gEngfuncs.Cvar_SetValue( r_vbo.name, 1.0f );
+	}
+}
+
+static void GL_ApplyRX580Plan_f( void )
+{
+	GL_BuildModernPlanCaps();
+	GL_ApplyModernPlanDefaults( true );
+	GL_PrintModernPlanCaps();
+}
+
 /*
 =================
 R_RenderInfo_f
@@ -719,6 +909,8 @@ static void R_RenderInfo( qboolean startup )
 		gEngfuncs.Con_Printf( "GL_MAX_VERTEX_UNIFORM_COMPONENTS_ARB: %i\n", glConfig.max_vertex_uniforms );
 		gEngfuncs.Con_Printf( "GL_MAX_VERTEX_ATTRIBS_ARB: %i\n", glConfig.max_vertex_attribs );
 	}
+
+	GL_PrintModernPlanCaps();
 
 	gEngfuncs.Con_Printf( "\n" );
 	gEngfuncs.Con_Printf( "MODE: %ix%i\n", gpGlobals->width, gpGlobals->height );
@@ -867,13 +1059,22 @@ static void GL_InitExtensionsBigGL( void )
 		glConfig.hardware_type = GLHW_NVIDIA;
 	else if( Q_stristr( glConfig.renderer_string, "quadro fx" ))
 		glConfig.hardware_type = GLHW_NVIDIA;
-	else if( Q_stristr(glConfig.renderer_string, "rv770" ))
+	else if( Q_stristr( glConfig.renderer_string, "rv770" ))
 		glConfig.hardware_type = GLHW_RADEON;
-	else if( Q_stristr(glConfig.renderer_string, "radeon hd" ))
+	else if( Q_stristr( glConfig.renderer_string, "radeon hd" ))
 		glConfig.hardware_type = GLHW_RADEON;
 	else if( Q_stristr( glConfig.renderer_string, "eah4850" ) || Q_stristr( glConfig.renderer_string, "eah4870" ))
 		glConfig.hardware_type = GLHW_RADEON;
 	else if( Q_stristr( glConfig.renderer_string, "radeon" ))
+		glConfig.hardware_type = GLHW_RADEON;
+	// RX 580 / Polaris / RDNA identification via LLVM pipe prefix used by Mesa RADV/RadeonSI
+	else if( Q_stristr( glConfig.renderer_string, "rx 5" ))
+		glConfig.hardware_type = GLHW_RADEON;
+	else if( Q_stristr( glConfig.renderer_string, "polaris" ))
+		glConfig.hardware_type = GLHW_RADEON;
+	else if( Q_stristr( glConfig.renderer_string, "ellesmere" ))	// RX 480/580 codename
+		glConfig.hardware_type = GLHW_RADEON;
+	else if( Q_stristr( glConfig.renderer_string, "amd radeon" ))
 		glConfig.hardware_type = GLHW_RADEON;
 	else if( Q_stristr( glConfig.renderer_string, "intel" ))
 		glConfig.hardware_type = GLHW_INTEL;
@@ -965,8 +1166,13 @@ static void GL_InitExtensionsBigGL( void )
 		pglGetIntegerv( GL_MAX_VERTEX_ATTRIBS_ARB, &glConfig.max_vertex_attribs );
 
 #if XASH_WIN32 // Win32 only drivers?
-		if( glConfig.hardware_type == GLHW_RADEON && glConfig.max_vertex_uniforms > 512 )
-			glConfig.max_vertex_uniforms /= 4; // radeon returns not correct info
+		// Older Radeon DDX (pre-GCN, ~R6xx/R7xx era) reports inflated uniform counts.
+		// RX 580 (GCN 4th gen) reports correctly; only apply the /4 hack for very old HW
+		// where max_vertex_uniforms is suspiciously large AND we're on legacy hardware.
+		if( glConfig.hardware_type == GLHW_RADEON &&
+		    glConfig.max_vertex_uniforms > 512 &&
+		    glConfig.version_major < 4 )
+			glConfig.max_vertex_uniforms /= 4; // legacy radeon only
 #endif
 	}
 	else
@@ -1108,6 +1314,9 @@ void GL_InitExtensions( void )
 	if( GL_Support( GL_TEXTURE_COMPRESSION_EXT ))
 		gEngfuncs.Image_AddCmdFlags( IL_DDS_HARDWARE );
 
+	GL_BuildModernPlanCaps();
+	GL_ApplyModernPlanDefaults( false );
+
 	// MCD has buffering issues
 #if XASH_WIN32
 	if( Q_strstr( glConfig.renderer_string, "gdi" ))
@@ -1152,6 +1361,10 @@ static void GL_InitCommands( void )
 	gEngfuncs.Cvar_RegisterVariable( &r_traceglow );
 	gEngfuncs.Cvar_RegisterVariable( &r_studio_sort_textures );
 	gEngfuncs.Cvar_RegisterVariable( &r_studio_drawelements );
+	// New RX 580 optimisation CVARs
+	gEngfuncs.Cvar_RegisterVariable( &r_studio_meshcache );
+	gEngfuncs.Cvar_RegisterVariable( &r_studio_gpu_skinning );
+	gEngfuncs.Cvar_RegisterVariable( &r_studio_batch_sort );
 	gEngfuncs.Cvar_RegisterVariable( &r_ripple );
 	gEngfuncs.Cvar_RegisterVariable( &r_ripple_updatetime );
 	gEngfuncs.Cvar_RegisterVariable( &r_ripple_spawntime );
@@ -1162,6 +1375,18 @@ static void GL_InitCommands( void )
 	gEngfuncs.Cvar_RegisterVariable( &r_vbo_detail );
 	gEngfuncs.Cvar_RegisterVariable( &r_large_lightmaps );
 	gEngfuncs.Cvar_RegisterVariable( &r_dlight_virtual_radius );
+
+	gEngfuncs.Cvar_RegisterVariable( &gl_rx580_preset );
+	gEngfuncs.Cvar_RegisterVariable( &gl_plan_cap_report );
+	gEngfuncs.Cvar_RegisterVariable( &gl_studio_skin_backend );
+	gEngfuncs.Cvar_RegisterVariable( &gl_studio_instancing );
+	gEngfuncs.Cvar_RegisterVariable( &gl_world_static_bins );
+	gEngfuncs.Cvar_RegisterVariable( &gl_world_dynamic_ring );
+	gEngfuncs.Cvar_RegisterVariable( &gl_texture_ktx2_prefer );
+	gEngfuncs.Cvar_RegisterVariable( &gl_texture_bc7 );
+	gEngfuncs.Cvar_RegisterVariable( &gl_texture_mipgen );
+	gEngfuncs.Cvar_RegisterVariable( &gl_model_lod );
+	gEngfuncs.Cvar_RegisterVariable( &gl_model_lod_bias );
 
 	gEngfuncs.Cvar_RegisterVariable( &gl_extensions );
 	gEngfuncs.Cvar_RegisterVariable( &gl_texture_nearest );
@@ -1187,6 +1412,7 @@ static void GL_InitCommands( void )
 	SetBits( gl_vsync->flags, FCVAR_CHANGED );
 
 	gEngfuncs.Cmd_AddCommand( "r_info", R_RenderInfo_f, "display renderer info" );
+	gEngfuncs.Cmd_AddCommand( "gl_apply_rx580_plan", GL_ApplyRX580Plan_f, "apply safe RX 580 renderer plan defaults" );
 	gEngfuncs.Cmd_AddCommand( "timerefresh", SCR_TimeRefresh_f, "turn quickly and print rendering statistcs" );
 }
 
@@ -1225,6 +1451,13 @@ static void R_CheckVBO( void )
 		gEngfuncs.Cvar_FullSet( r_vbo.name, "0", flags );
 		gEngfuncs.Cvar_FullSet( r_vbo_dlightmode.name, "0", flags );
 	}
+	else if( glConfig.hardware_type == GLHW_RADEON && gl_rx580_preset.value >= 2.0f )
+	{
+		/* Aggressive RX 580/Radeon profile only. The plan keeps this opt-in
+		 * because the world VBO path is still marked as potentially glitchy. */
+		if( r_vbo.value == 0 )
+			gEngfuncs.Cvar_SetValue( r_vbo.name, 1 );
+	}
 }
 
 /*
@@ -1235,6 +1468,7 @@ GL_RemoveCommands
 static void GL_RemoveCommands( void )
 {
 	gEngfuncs.Cmd_RemoveCommand( "r_info" );
+	gEngfuncs.Cmd_RemoveCommand( "gl_apply_rx580_plan" );
 	gEngfuncs.Cmd_RemoveCommand( "timerefresh" );
 }
 

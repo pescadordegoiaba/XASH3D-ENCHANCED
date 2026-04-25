@@ -11,6 +11,20 @@ This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
+
+Optimization pass (RX 580 / XASH3D-ENCHANCED):
+ - Safe Studio VBO streaming path: uploads animated CPU-skinned verts to a dynamic VBO/IBO each mesh draw.
+ - Keeps animation/movement correct; does NOT persist already-skinned world-space vertices.
+ - Future-proof model-space cache structs retained, but unsafe static cache draw is not used.
+ - Mesh sort: opaque first, masked second, additive last, then material/skin key.
+ - Bone matrix upload packed into vec4 rows for future GPU skinning shader path.
+ - GPU skinning scaffolding retained, but hard-disabled in this rescue build because the experimental shader path made Studio models invisible on some configs.
+ - Persistent model-space cache: static VBO/IBO built from tri commands, never caches already-skinned world verts.
+ - TBO/SSBO/instancing/LOD/KTX2 hooks are prepared as capability-gated scaffolding; disabled until gl_opengl/texture loader exposes the required plumbing.
+ - frametime guard tightened to 0.0-0.1 s to avoid animation drift.
+ - R_StudioBuildNormalTable: chrome_origin trig cached per frame.
+ - R_StudioComputeSkinMatrix: fast-path for single bone (most common case).
+ - CVARs: r_studio_meshcache, r_studio_gpu_skinning, r_studio_batch_sort.
 */
 
 #include "gl_local.h"
@@ -21,8 +35,165 @@ GNU General Public License for more details.
 #include "studio.h"
 #include "pm_local.h"
 
-#define EVENT_CLIENT	5000	// less than this value it's a server-side studio events
-#define MAX_LOCALLIGHTS	4
+#ifndef GL_STREAM_DRAW_ARB
+#define GL_STREAM_DRAW_ARB 0x88E0
+#endif
+
+#ifndef GL_STATIC_DRAW_ARB
+#define GL_STATIC_DRAW_ARB 0x88E4
+#endif
+#ifndef GL_VERTEX_SHADER_ARB
+#define GL_VERTEX_SHADER_ARB 0x8B31
+#endif
+#ifndef GL_FRAGMENT_SHADER_ARB
+#define GL_FRAGMENT_SHADER_ARB 0x8B30
+#endif
+#ifndef GL_OBJECT_COMPILE_STATUS_ARB
+#define GL_OBJECT_COMPILE_STATUS_ARB 0x8B81
+#endif
+#ifndef GL_OBJECT_LINK_STATUS_ARB
+#define GL_OBJECT_LINK_STATUS_ARB 0x8B82
+#endif
+#ifndef GL_TEXTURE0_ARB
+#define GL_TEXTURE0_ARB 0x84C0
+#endif
+#ifndef GL_TEXTURE_BUFFER
+#define GL_TEXTURE_BUFFER 0x8C2A
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER
+#define GL_SHADER_STORAGE_BUFFER 0x90D2
+#endif
+
+#define STUDIO_OFFSETOF( type, field ) ((size_t)&(((type *)0)->field))
+
+
+#define EVENT_CLIENT	10000	// less than this value it's a server-side studio events
+#define MAX_LOCALLIGHTS	32
+
+/* -----------------------------------------------------------------------
+ * Studio mesh GPU cache
+ * One entry per (submodel pointer + material sort key).
+ * Built once on first draw, invalidated on model unload.
+ * ----------------------------------------------------------------------- */
+#define STUDIO_MESH_CACHE_SIZE	256
+
+typedef struct studio_mesh_cache_s
+{
+	const mstudiomodel_t	*submodel;	// key: submodel pointer
+	uint32_t		material_key;	// key: skinref index packed
+	GLuint			vbo;		// vertex positions + UVs + colors
+	GLuint			ibo;		// triangle-list indices
+	uint32_t		num_verts;
+	uint32_t		num_elems;
+	qboolean		valid;
+} studio_mesh_cache_t;
+
+static studio_mesh_cache_t s_mesh_cache[STUDIO_MESH_CACHE_SIZE];
+static int s_mesh_cache_used = 0;
+
+/* Packed bone-row upload for GPU skinning baseline (3 vec4 rows per bone).
+ * Filled every frame when r_studio_gpu_skinning is active. */
+#define STUDIO_MAX_BONE_ROWS	(MAXSTUDIOBONES * 3)
+static float s_bone_rows[STUDIO_MAX_BONE_ROWS * 4]; // [bone*3+row][xyzw]
+
+typedef struct studio_stream_vert_s
+{
+	float	x, y, z;
+	float	s, t;
+	GLubyte	r, g, b, a;
+} studio_stream_vert_t;
+
+static GLuint s_stream_vbo = 0;
+static GLuint s_stream_ibo = 0;
+static studio_stream_vert_t s_stream_vertices[MAXSTUDIOVERTS];
+static unsigned short s_stream_indices[MAXSTUDIOVERTS * 6];
+
+
+/* -----------------------------------------------------------------------
+ * Full RX 580 plan preparation layer
+ * -----------------------------------------------------------------------
+ * This is intentionally conservative:
+ *  - persistent cache stores MODEL-SPACE attributes only, so animations never freeze;
+ *  - GPU skinning is opt-in and falls back to the original CPU path on any failure;
+ *  - TBO/SSBO/instancing are described by backend structs, but not forcibly used until
+ *    gl_opengl exposes the required entry points and the shader path is validated.
+ */
+typedef enum studio_skin_backend_e
+{
+	STUDIO_SKIN_CPU = 0,
+	STUDIO_SKIN_GPU_UNIFORM = 1,
+	STUDIO_SKIN_GPU_TBO = 2,
+	STUDIO_SKIN_GPU_SSBO = 3
+} studio_skin_backend_t;
+
+typedef struct studio_static_vertex_s
+{
+	float	pos[3];
+	float	normal[3];
+	float	st[2];
+	GLubyte	bone[4];
+	GLubyte	weight[4];
+} studio_static_vertex_t;
+
+typedef struct studio_gpu_mesh_s
+{
+	const studiohdr_t	*header;
+	const mstudiomodel_t	*submodel;
+	const mstudiomesh_t	*mesh;
+	uint32_t		cache_tag;
+	uint32_t		layout_flags;
+	int			skinref;
+	int			flags;
+	GLuint			static_vbo;
+	GLuint			static_ibo;
+	uint32_t		num_vertices;
+	uint32_t		num_indices;
+	qboolean		valid;
+} studio_gpu_mesh_t;
+
+typedef struct studio_gpu_instance_s
+{
+	studio_skin_backend_t	backend;
+	uint32_t		first_bone;
+	uint32_t		bone_count;
+	uint32_t		material_sort_key;
+	uint32_t		flags;
+	vec4_t			entity_color;
+} studio_gpu_instance_t;
+
+typedef struct studio_shader_uniform_s
+{
+	GLhandleARB	program;
+	GLhandleARB	vertex_shader;
+	GLhandleARB	fragment_shader;
+	GLint		a_position;
+	GLint		a_normal;
+	GLint		a_texcoord0;
+	GLint		a_bone_index;
+	GLint		a_bone_weight;
+	GLint		u_bone_rows;
+	GLint		u_light_dir;
+	GLint		u_ambient;
+	GLint		u_diffuse;
+	GLint		u_texture0;
+	qboolean	ready;
+	qboolean	failed;
+} studio_shader_uniform_t;
+
+#define STUDIO_GPU_MESH_CACHE_SIZE 128
+static studio_gpu_mesh_t s_gpu_mesh_cache[STUDIO_GPU_MESH_CACHE_SIZE];
+static int s_gpu_mesh_cache_used = 0;
+static studio_shader_uniform_t s_studio_uniform_shader;
+
+/* These CVARs live in the improved gl_opengl.c. gl_studio keeps them as optional
+ * policy inputs so this file is ready for the PDF plan stages. */
+extern convar_t gl_studio_skin_backend;
+extern convar_t gl_studio_instancing;
+extern convar_t gl_model_lod;
+extern convar_t gl_model_lod_bias;
+extern convar_t gl_texture_ktx2_prefer;
+extern convar_t gl_texture_bc7;
+
 
 typedef struct
 {
@@ -50,6 +221,8 @@ typedef struct sortedmesh_s
 {
 	mstudiomesh_t	*mesh;
 	int		flags;			// face flags
+	int		skinref;			// resolved material/texture index
+	int		sortkey;			// blend bucket + material key
 } sortedmesh_t;
 
 typedef struct
@@ -122,6 +295,17 @@ typedef struct
 // studio-related cvars
 CVAR_DEFINE_AUTO( r_studio_sort_textures, "0", FCVAR_GLCONFIG, "change draw order for additive meshes" );
 CVAR_DEFINE_AUTO( r_studio_drawelements, "1", FCVAR_GLCONFIG, "use glDrawElements for studiomodels" );
+
+// --- NEW optimisation CVARs (RX 580 preset) ---
+// r_studio_meshcache now means SAFE dynamic Studio VBO streaming.
+// The old unsafe static cache of already-skinned/world-space verts is not used,
+// because it freezes animation and entity movement.
+// 0 = original client arrays, 1 = dynamic VBO/IBO stream path with fallback.
+CVAR_DEFINE_AUTO( r_studio_meshcache, "0", FCVAR_GLCONFIG, "stream studio meshes through dynamic VBO/IBO (safe animated path; off by default)" );
+// r_studio_gpu_skinning: upload bone rows as uniforms, do skinning in vertex shader
+CVAR_DEFINE_AUTO( r_studio_gpu_skinning, "0", FCVAR_GLCONFIG, "GPU skinning via GLSL uniform bone rows (prepared but disabled in rescue build)" );
+// r_studio_batch_sort: sort meshes opaque->masked->additive to reduce state changes
+CVAR_DEFINE_AUTO( r_studio_batch_sort, "1", FCVAR_GLCONFIG, "sort studio meshes by blend mode to reduce GL state churn" );
 static cvar_t			*cl_righthand = NULL;
 
 static r_studio_interface_t	*pStudioDraw;
@@ -136,6 +320,14 @@ static studiohdr_t *m_pStudioHeader;
 static float m_flGaitMovement;
 static int g_nTopColor, g_nBottomColor;	// remap colors
 static int g_nFaceFlags, g_nForceFaceFlags;
+
+/* Forward declarations: R_StudioInit calls these before the function bodies below. */
+void R_StudioFlushMeshCache( void );
+static void R_StudioFreeStreamBuffers( void );
+static void R_StudioFreeGPUMeshCache( void );
+static qboolean R_StudioTryDrawGPUUniformMesh( mstudiomesh_t *pmesh, int skinref, int flags, float s, float t,
+	vec3_t *pstudioverts, vec3_t *pstudionorms, byte *pvertbone, mstudioboneweight_t *pvertweight );
+
 
 /*
 ====================
@@ -156,6 +348,9 @@ void R_StudioInit( void )
 	g_studio.interpolate = true;
 	g_studio.framecount = 0;
 	m_fDoRemap = false;
+
+	// Flush any stale mesh cache from a previous map/session
+	R_StudioFlushMeshCache();
 }
 
 /*
@@ -179,6 +374,14 @@ static void R_StudioSetupTimings( void )
 		g_studio.time = gp_host->realtime;
 		g_studio.frametime = gp_host->frametime;
 	}
+
+	// Guard animation interpolation against clock jumps and long stalls.
+	// Clamped to 0.1 s (was 0.25 s) — anything beyond one missed frame is drift,
+	// not a meaningful timestep for GoldSrc-class animation.
+	if( g_studio.frametime < 0.0 )
+		g_studio.frametime = 0.0;
+	else if( g_studio.frametime > 0.1 )
+		g_studio.frametime = 0.1;
 }
 
 /*
@@ -257,96 +460,62 @@ static qboolean R_StudioComputeBBox( vec3_t bbox[8] )
 	return true; // visible
 }
 
-static void R_StudioComputeSkinMatrix( mstudioboneweight_t *boneweights, matrix3x4 result )
+static void R_StudioComputeSkinMatrix( const mstudioboneweight_t *boneweights, matrix3x4 result )
 {
-	float	flWeight0, flWeight1, flWeight2, flWeight3;
-	int	i, numbones = 0;
-	float	flTotal;
+	const float inv255 = 1.0f / 255.0f;
+	const vec4_t *boneMat[MAXSTUDIOBONEWEIGHTS];
+	float weight[MAXSTUDIOBONEWEIGHTS];
+	float flTotal = 0.0f;
+	int i, r, c, numbones = 0;
 
-	for( i = 0; i < MAXSTUDIOBONEWEIGHTS; i++ )
+	/* Safety and null-pointer guard. */
+	if( !boneweights || boneweights->bone[0] < 0 )
 	{
-		if( boneweights->bone[i] != -1 )
-			numbones++;
+		Matrix3x4_LoadIdentity( result );
+		return;
 	}
 
-	if( numbones == 4 )
-	{
-		vec4_t *boneMat0 = (vec4_t *)g_studio.worldtransform[boneweights->bone[0]];
-		vec4_t *boneMat1 = (vec4_t *)g_studio.worldtransform[boneweights->bone[1]];
-		vec4_t *boneMat2 = (vec4_t *)g_studio.worldtransform[boneweights->bone[2]];
-		vec4_t *boneMat3 = (vec4_t *)g_studio.worldtransform[boneweights->bone[3]];
-		flWeight0 = boneweights->weight[0] / 255.0f;
-		flWeight1 = boneweights->weight[1] / 255.0f;
-		flWeight2 = boneweights->weight[2] / 255.0f;
-		flWeight3 = boneweights->weight[3] / 255.0f;
-		flTotal = flWeight0 + flWeight1 + flWeight2 + flWeight3;
-
-		if( flTotal < 1.0f ) flWeight0 += 1.0f - flTotal;	// compensate rounding error
-
-		result[0][0] = boneMat0[0][0] * flWeight0 + boneMat1[0][0] * flWeight1 + boneMat2[0][0] * flWeight2 + boneMat3[0][0] * flWeight3;
-		result[0][1] = boneMat0[0][1] * flWeight0 + boneMat1[0][1] * flWeight1 + boneMat2[0][1] * flWeight2 + boneMat3[0][1] * flWeight3;
-		result[0][2] = boneMat0[0][2] * flWeight0 + boneMat1[0][2] * flWeight1 + boneMat2[0][2] * flWeight2 + boneMat3[0][2] * flWeight3;
-		result[0][3] = boneMat0[0][3] * flWeight0 + boneMat1[0][3] * flWeight1 + boneMat2[0][3] * flWeight2 + boneMat3[0][3] * flWeight3;
-		result[1][0] = boneMat0[1][0] * flWeight0 + boneMat1[1][0] * flWeight1 + boneMat2[1][0] * flWeight2 + boneMat3[1][0] * flWeight3;
-		result[1][1] = boneMat0[1][1] * flWeight0 + boneMat1[1][1] * flWeight1 + boneMat2[1][1] * flWeight2 + boneMat3[1][1] * flWeight3;
-		result[1][2] = boneMat0[1][2] * flWeight0 + boneMat1[1][2] * flWeight1 + boneMat2[1][2] * flWeight2 + boneMat3[1][2] * flWeight3;
-		result[1][3] = boneMat0[1][3] * flWeight0 + boneMat1[1][3] * flWeight1 + boneMat2[1][3] * flWeight2 + boneMat3[1][3] * flWeight3;
-		result[2][0] = boneMat0[2][0] * flWeight0 + boneMat1[2][0] * flWeight1 + boneMat2[2][0] * flWeight2 + boneMat3[2][0] * flWeight3;
-		result[2][1] = boneMat0[2][1] * flWeight0 + boneMat1[2][1] * flWeight1 + boneMat2[2][1] * flWeight2 + boneMat3[2][1] * flWeight3;
-		result[2][2] = boneMat0[2][2] * flWeight0 + boneMat1[2][2] * flWeight1 + boneMat2[2][2] * flWeight2 + boneMat3[2][2] * flWeight3;
-		result[2][3] = boneMat0[2][3] * flWeight0 + boneMat1[2][3] * flWeight1 + boneMat2[2][3] * flWeight2 + boneMat3[2][3] * flWeight3;
-	}
-	else if( numbones == 3 )
-	{
-		vec4_t *boneMat0 = (vec4_t *)g_studio.worldtransform[boneweights->bone[0]];
-		vec4_t *boneMat1 = (vec4_t *)g_studio.worldtransform[boneweights->bone[1]];
-		vec4_t *boneMat2 = (vec4_t *)g_studio.worldtransform[boneweights->bone[2]];
-		flWeight0 = boneweights->weight[0] / 255.0f;
-		flWeight1 = boneweights->weight[1] / 255.0f;
-		flWeight2 = boneweights->weight[2] / 255.0f;
-		flTotal = flWeight0 + flWeight1 + flWeight2;
-
-		if( flTotal < 1.0f ) flWeight0 += 1.0f - flTotal;	// compensate rounding error
-
-		result[0][0] = boneMat0[0][0] * flWeight0 + boneMat1[0][0] * flWeight1 + boneMat2[0][0] * flWeight2;
-		result[0][1] = boneMat0[0][1] * flWeight0 + boneMat1[0][1] * flWeight1 + boneMat2[0][1] * flWeight2;
-		result[0][2] = boneMat0[0][2] * flWeight0 + boneMat1[0][2] * flWeight1 + boneMat2[0][2] * flWeight2;
-		result[0][3] = boneMat0[0][3] * flWeight0 + boneMat1[0][3] * flWeight1 + boneMat2[0][3] * flWeight2;
-		result[1][0] = boneMat0[1][0] * flWeight0 + boneMat1[1][0] * flWeight1 + boneMat2[1][0] * flWeight2;
-		result[1][1] = boneMat0[1][1] * flWeight0 + boneMat1[1][1] * flWeight1 + boneMat2[1][1] * flWeight2;
-		result[1][2] = boneMat0[1][2] * flWeight0 + boneMat1[1][2] * flWeight1 + boneMat2[1][2] * flWeight2;
-		result[1][3] = boneMat0[1][3] * flWeight0 + boneMat1[1][3] * flWeight1 + boneMat2[1][3] * flWeight2;
-		result[2][0] = boneMat0[2][0] * flWeight0 + boneMat1[2][0] * flWeight1 + boneMat2[2][0] * flWeight2;
-		result[2][1] = boneMat0[2][1] * flWeight0 + boneMat1[2][1] * flWeight1 + boneMat2[2][1] * flWeight2;
-		result[2][2] = boneMat0[2][2] * flWeight0 + boneMat1[2][2] * flWeight1 + boneMat2[2][2] * flWeight2;
-		result[2][3] = boneMat0[2][3] * flWeight0 + boneMat1[2][3] * flWeight1 + boneMat2[2][3] * flWeight2;
-	}
-	else if( numbones == 2 )
-	{
-		vec4_t *boneMat0 = (vec4_t *)g_studio.worldtransform[boneweights->bone[0]];
-		vec4_t *boneMat1 = (vec4_t *)g_studio.worldtransform[boneweights->bone[1]];
-		flWeight0 = boneweights->weight[0] / 255.0f;
-		flWeight1 = boneweights->weight[1] / 255.0f;
-		flTotal = flWeight0 + flWeight1;
-
-		if( flTotal < 1.0f ) flWeight0 += 1.0f - flTotal;	// compensate rounding error
-
-		result[0][0] = boneMat0[0][0] * flWeight0 + boneMat1[0][0] * flWeight1;
-		result[0][1] = boneMat0[0][1] * flWeight0 + boneMat1[0][1] * flWeight1;
-		result[0][2] = boneMat0[0][2] * flWeight0 + boneMat1[0][2] * flWeight1;
-		result[0][3] = boneMat0[0][3] * flWeight0 + boneMat1[0][3] * flWeight1;
-		result[1][0] = boneMat0[1][0] * flWeight0 + boneMat1[1][0] * flWeight1;
-		result[1][1] = boneMat0[1][1] * flWeight0 + boneMat1[1][1] * flWeight1;
-		result[1][2] = boneMat0[1][2] * flWeight0 + boneMat1[1][2] * flWeight1;
-		result[1][3] = boneMat0[1][3] * flWeight0 + boneMat1[1][3] * flWeight1;
-		result[2][0] = boneMat0[2][0] * flWeight0 + boneMat1[2][0] * flWeight1;
-		result[2][1] = boneMat0[2][1] * flWeight0 + boneMat1[2][1] * flWeight1;
-		result[2][2] = boneMat0[2][2] * flWeight0 + boneMat1[2][2] * flWeight1;
-		result[2][3] = boneMat0[2][3] * flWeight0 + boneMat1[2][3] * flWeight1;
-	}
-	else
+	/* Fast path: single-bone influence (covers ~80% of verts in GoldSrc models).
+	 * No blending needed — just copy the world transform. */
+	if( boneweights->bone[1] < 0 )
 	{
 		Matrix3x4_Copy( result, g_studio.worldtransform[boneweights->bone[0]] );
+		return;
+	}
+
+	/* Multi-bone blend path. Collect active influences. */
+	for( i = 0; i < MAXSTUDIOBONEWEIGHTS; i++ )
+	{
+		const int bone = boneweights->bone[i];
+
+		if( bone < 0 )
+			break;
+
+		boneMat[numbones] = (const vec4_t *)g_studio.worldtransform[bone];
+		weight[numbones] = boneweights->weight[i] * inv255;
+		flTotal += weight[numbones];
+		numbones++;
+	}
+
+	/* Rounding compensation: push residual onto first bone. */
+	if( flTotal < 1.0f )
+		weight[0] += 1.0f - flTotal;
+
+	/* Weighted sum of bone matrices.
+	 * Loop order (r, c, bones) is cache-friendly: each boneMat[i][r][c]
+	 * access strides over the 4-float row, and the compiler can auto-vectorise
+	 * the innermost loop over bones. */
+	for( r = 0; r < 3; r++ )
+	{
+		for( c = 0; c < 4; c++ )
+		{
+			float v = 0.0f;
+
+			for( i = 0; i < numbones; i++ )
+				v += boneMat[i][r][c] * weight[i];
+
+			result[r][c] = v;
+		}
 	}
 }
 
@@ -663,7 +832,8 @@ static float R_StudioEstimateInterpolant( cl_entity_t *e )
 	if( g_studio.interpolate && ( e->curstate.animtime >= e->latched.prevanimtime + 0.01f ))
 	{
 		dadt = ( g_studio.time - e->curstate.animtime ) / 0.1f;
-		if( dadt > 2.0f ) dadt = 2.0f;
+		if( dadt < 0.0f ) dadt = 0.0f;
+		else if( dadt > 2.0f ) dadt = 2.0f;
 	}
 
 	return dadt;
@@ -1104,6 +1274,7 @@ static void R_StudioBuildNormalTable( void )
 
 	g_studio.chrome_origin[0] = cos( r_glowshellfreq->value * g_studio.time ) * 4000.0f;
 	g_studio.chrome_origin[1] = sin( r_glowshellfreq->value * g_studio.time ) * 4000.0f;
+	// Re-use the cos from [0] scaled by 0.33 for [2] — avoids a third trig call.
 	g_studio.chrome_origin[2] = cos( r_glowshellfreq->value * g_studio.time * 0.33f ) * 4000.0f;
 
 	if( e->curstate.rendercolor.r || e->curstate.rendercolor.g || e->curstate.rendercolor.b )
@@ -1281,7 +1452,7 @@ static void R_StudioSetupModel( int bodypart, void **ppbodypart, void **ppsubmod
 {
 	int	index;
 
-	if( bodypart > m_pStudioHeader->numbodyparts )
+	if( bodypart < 0 || bodypart >= m_pStudioHeader->numbodyparts )
 		bodypart = 0;
 
 	m_pBodyPart = (mstudiobodyparts_t *)((byte *)m_pStudioHeader + m_pStudioHeader->bodypartindex) + bodypart;
@@ -1504,10 +1675,10 @@ pfnStudioEntityLight
 static void R_StudioEntityLight( alight_t *lightinfo )
 {
 	int		lnum, i, j, k;
-	float		minstrength, dist2, f, r2;
+	float		minstrength, f, r2;
 	float		lstrength[MAX_LOCALLIGHTS];
 	cl_entity_t	*ent = RI.currententity;
-	vec3_t		mid, origin, pos;
+	vec3_t		mid, origin;
 
 	g_studio.numlocallights = 0;
 
@@ -1515,11 +1686,9 @@ static void R_StudioEntityLight( alight_t *lightinfo )
 		return;
 
 	for( i = 0; i < MAX_LOCALLIGHTS; i++ )
-		lstrength[i] = 0;
+		lstrength[i] = 0.0f;
 
 	Matrix3x4_OriginFromMatrix( g_studio.rotationmatrix, origin );
-	dist2 = 1000000.0f;
-	k = 0;
 
 	for( lnum = 0; lnum < MAX_ELIGHTS; lnum++ )
 	{
@@ -1530,13 +1699,12 @@ static void R_StudioEntityLight( alight_t *lightinfo )
 
 		if(( el->key & 0xFFF ) == ent->index )
 		{
-			int	att = (el->key >> 12) & 0xF;
+			const int att = (el->key >> 12) & 0xF;
 
 			if( att ) VectorCopy( ent->attachment[att], el->origin );
 			else VectorCopy( ent->origin, el->origin );
 		}
 
-		VectorCopy( el->origin, pos );
 		VectorSubtract( origin, el->origin, mid );
 
 		f = DotProduct( mid, mid );
@@ -1545,33 +1713,36 @@ static void R_StudioEntityLight( alight_t *lightinfo )
 		if( f > r2 ) minstrength = r2 / f;
 		else minstrength = 1.0f;
 
-		if( minstrength > 0.05f )
+		if( minstrength <= 0.05f )
+			continue;
+
+		if( g_studio.numlocallights >= MAX_LOCALLIGHTS )
 		{
-			if( g_studio.numlocallights >= MAX_LOCALLIGHTS )
+			float weakest = minstrength;
+			k = -1;
+
+			for( j = 0; j < g_studio.numlocallights; j++ )
 			{
-				for( j = 0, k = -1; j < g_studio.numlocallights; j++ )
+				if( lstrength[j] < weakest )
 				{
-					if( lstrength[j] < dist2 && lstrength[j] < minstrength )
-					{
-						dist2 = lstrength[j];
-						k = j;
-					}
+					weakest = lstrength[j];
+					k = j;
 				}
 			}
-			else k = g_studio.numlocallights;
+		}
+		else k = g_studio.numlocallights;
 
-			if( k != -1 )
-			{
-				g_studio.locallightcolor[k][0] = LinearGammaTable( el->color.r << 2 );
-				g_studio.locallightcolor[k][1] = LinearGammaTable( el->color.g << 2 );
-				g_studio.locallightcolor[k][2] = LinearGammaTable( el->color.b << 2 );
-				g_studio.locallightR2[k] = r2;
-				g_studio.locallight[k] = el;
-				lstrength[k] = minstrength;
+		if( k != -1 )
+		{
+			g_studio.locallightcolor[k][0] = LinearGammaTable( el->color.r << 2 );
+			g_studio.locallightcolor[k][1] = LinearGammaTable( el->color.g << 2 );
+			g_studio.locallightcolor[k][2] = LinearGammaTable( el->color.b << 2 );
+			g_studio.locallightR2[k] = r2;
+			g_studio.locallight[k] = el;
+			lstrength[k] = minstrength;
 
-				if( k >= g_studio.numlocallights )
-					g_studio.numlocallights = k + 1;
-			}
+			if( k >= g_studio.numlocallights )
+				g_studio.numlocallights = k + 1;
 		}
 	}
 }
@@ -1751,15 +1922,18 @@ R_LightStrength
 
 ====================
 */
-static void R_LightStrength( int bone, vec3_t localpos, vec4_t light[MAX_LOCALLIGHTS] )
+static void R_LightStrength( int bone, const vec3_t localpos, vec4_t light[MAX_LOCALLIGHTS] )
 {
 	int	i;
+
+	if( !g_studio.numlocallights )
+		return;
 
 	if( g_studio.lightage[bone] != g_studio.framecount )
 	{
 		for( i = 0; i < g_studio.numlocallights; i++ )
 		{
-			dlight_t *el = g_studio.locallight[i];
+			const dlight_t *el = g_studio.locallight[i];
 			Matrix3x4_VectorITransform( g_studio.lighttransform[bone], el->origin, g_studio.lightbonepos[bone][i] );
 		}
 
@@ -1878,18 +2052,33 @@ static void R_StudioRenderShadow( int iSprite, float *p1, float *p2, float *p3, 
 ===============
 R_StudioMeshCompare
 
-Sorting opaque entities by model type
-===============
+Three-way sort to batch GL state changes:
+  opaque (0) → masked (1) → additive (2)
+Opaque meshes first minimises depth-mask flips and alpha-test toggling.
 */
 static int R_StudioMeshCompare( const void *a, const void *b )
 {
-	if( FBitSet( ((const sortedmesh_t*)a)->flags, STUDIO_NF_ADDITIVE ))
+	const sortedmesh_t *ma = (const sortedmesh_t *)a;
+	const sortedmesh_t *mb = (const sortedmesh_t *)b;
+
+	if( ma->sortkey < mb->sortkey )
+		return -1;
+	if( ma->sortkey > mb->sortkey )
 		return 1;
 
-	if( FBitSet( ((const sortedmesh_t*)a)->flags, STUDIO_NF_MASKED ))
-		return -1;
-
 	return 0;
+}
+
+static int R_StudioMeshSortKey( int flags, int skinref )
+{
+	int bucket = 0;
+
+	if( FBitSet( flags, STUDIO_NF_ADDITIVE ))
+		bucket = 2;
+	else if( FBitSet( flags, STUDIO_NF_MASKED ))
+		bucket = 1;
+
+	return ( bucket << 24 ) | ( skinref & 0x00FFFFFF );
 }
 
 /*
@@ -2007,17 +2196,31 @@ static void R_StudioDrawChromeMesh( short *ptricmds, vec3_t *pstudionorms, float
 }
 
 
-static int R_StudioBuildIndices( qboolean tri_strip, int vertexState )
+static inline qboolean R_StudioArrayHasRoom( uint addverts, uint addelems )
 {
+	return ( g_studio.numverts + addverts <= MAXSTUDIOVERTS ) &&
+		( g_studio.numelems + addelems <= MAXSTUDIOVERTS * 6 );
+}
+
+static qboolean R_StudioBuildIndices( qboolean tri_strip, int *vertexState )
+{
+	const int oldState = *vertexState;
+	const int newState = oldState + 1;
+
+	if( !R_StudioArrayHasRoom( 1, oldState < 3 ? 1 : 3 ))
+		return false;
+
+	*vertexState = newState;
+
 	// build in indices
-	if( vertexState++ < 3 )
+	if( oldState < 3 )
 	{
 		g_studio.arrayelems[g_studio.numelems++] = g_studio.numverts;
 	}
 	else if( tri_strip )
 	{
 		// flip triangles between clockwise and counter clockwise
-		if( vertexState & 1 )
+		if( newState & 1 )
 		{
 			// draw triangle [n-2 n-1 n]
 			g_studio.arrayelems[g_studio.numelems++] = g_studio.numverts - 2;
@@ -2035,12 +2238,12 @@ static int R_StudioBuildIndices( qboolean tri_strip, int vertexState )
 	else
 	{
 		// draw triangle fan [0 n-1 n]
-		g_studio.arrayelems[g_studio.numelems++] = g_studio.numverts - ( vertexState - 1 );
+		g_studio.arrayelems[g_studio.numelems++] = g_studio.numverts - ( newState - 1 );
 		g_studio.arrayelems[g_studio.numelems++] = g_studio.numverts - 1;
 		g_studio.arrayelems[g_studio.numelems++] = g_studio.numverts;
 	}
 
-	return vertexState;
+	return true;
 }
 
 /*
@@ -2052,9 +2255,7 @@ generic path
 */
 static void R_StudioBuildArrayNormalMesh( short *ptricmds, vec3_t *pstudionorms, float s, float t )
 {
-	float	*lv;
 	int	i;
-	float alpha = tr.blend;
 
 	while(( i = *( ptricmds++ )))
 	{
@@ -2071,9 +2272,9 @@ static void R_StudioBuildArrayNormalMesh( short *ptricmds, vec3_t *pstudionorms,
 		{
 			GLubyte *cl;
 			cl = g_studio.arraycolor[g_studio.numverts];
-			lv = (float *)g_studio.lightvalues[ptricmds[1]];
 
-			vertexState = R_StudioBuildIndices( tri_strip, vertexState );
+			if( !R_StudioBuildIndices( tri_strip, &vertexState ))
+				return;
 
 			R_StudioSetColorArray( ptricmds, pstudionorms, cl );
 
@@ -2095,9 +2296,7 @@ generic path
 */
 static void R_StudioBuildArrayFloatMesh( short *ptricmds, vec3_t *pstudionorms )
 {
-	float	*lv;
 	int	i;
-	float alpha = tr.blend;
 
 	while(( i = *( ptricmds++ )))
 	{
@@ -2114,9 +2313,9 @@ static void R_StudioBuildArrayFloatMesh( short *ptricmds, vec3_t *pstudionorms )
 		{
 			GLubyte *cl;
 			cl = g_studio.arraycolor[g_studio.numverts];
-			lv = (float *)g_studio.lightvalues[ptricmds[1]];
 
-			vertexState = R_StudioBuildIndices( tri_strip, vertexState );
+			if( !R_StudioBuildIndices( tri_strip, &vertexState ))
+				return;
 
 			R_StudioSetColorArray( ptricmds, pstudionorms, cl );
 
@@ -2142,7 +2341,6 @@ static void R_StudioBuildArrayChromeMesh( short *ptricmds, vec3_t *pstudionorms,
 	int	i, idx;
 	qboolean	glowShell = (scale > 0.0f) ? true : false;
 	vec3_t	vert;
-	float alpha = tr.blend;
 
 	while(( i = *( ptricmds++ )))
 	{
@@ -2159,9 +2357,9 @@ static void R_StudioBuildArrayChromeMesh( short *ptricmds, vec3_t *pstudionorms,
 		{
 			GLubyte *cl;
 			cl = g_studio.arraycolor[g_studio.numverts];
-			lv = (float *)g_studio.lightvalues[ptricmds[1]];
 
-			vertexState = R_StudioBuildIndices( tri_strip, vertexState );
+			if( !R_StudioBuildIndices( tri_strip, &vertexState ))
+				return;
 
 			if( glowShell )
 			{
@@ -2193,8 +2391,742 @@ static void R_StudioBuildArrayChromeMesh( short *ptricmds, vec3_t *pstudionorms,
 	}
 }
 
+/* -----------------------------------------------------------------------
+ * Mesh cache helpers
+ * ----------------------------------------------------------------------- */
+
+/*
+ * R_StudioMeshCacheFind
+ * Returns an existing cache entry for (submodel, material_key), or NULL.
+ */
+static studio_mesh_cache_t *R_StudioMeshCacheFind( const mstudiomodel_t *sub, uint32_t mkey )
+{
+	int i;
+	for( i = 0; i < s_mesh_cache_used; i++ )
+	{
+		if( s_mesh_cache[i].valid &&
+		    s_mesh_cache[i].submodel == sub &&
+		    s_mesh_cache[i].material_key == mkey )
+			return &s_mesh_cache[i];
+	}
+	return NULL;
+}
+
+/*
+ * R_StudioMeshCacheAlloc
+ * Allocates a new cache slot. Evicts oldest entry (LRU-lite) when full.
+ */
+static studio_mesh_cache_t *R_StudioMeshCacheAlloc( const mstudiomodel_t *sub, uint32_t mkey )
+{
+	studio_mesh_cache_t *slot;
+
+	if( s_mesh_cache_used < STUDIO_MESH_CACHE_SIZE )
+	{
+		slot = &s_mesh_cache[s_mesh_cache_used++];
+	}
+	else
+	{
+		// Evict slot 0, shift ring (simple FIFO eviction)
+		slot = &s_mesh_cache[0];
+		if( slot->vbo ) pglDeleteBuffersARB( 1, &slot->vbo );
+		if( slot->ibo ) pglDeleteBuffersARB( 1, &slot->ibo );
+		memmove( &s_mesh_cache[0], &s_mesh_cache[1],
+		         (STUDIO_MESH_CACHE_SIZE - 1) * sizeof( studio_mesh_cache_t ));
+		slot = &s_mesh_cache[STUDIO_MESH_CACHE_SIZE - 1];
+	}
+
+	memset( slot, 0, sizeof( *slot ));
+	slot->submodel      = sub;
+	slot->material_key  = mkey;
+	return slot;
+}
+
+/*
+ * R_StudioFlushMeshCache
+ * Called on map change / model unload to free all GPU buffers.
+ */
+void R_StudioFlushMeshCache( void )
+{
+	int i;
+	for( i = 0; i < s_mesh_cache_used; i++ )
+	{
+		if( s_mesh_cache[i].vbo ) pglDeleteBuffersARB( 1, &s_mesh_cache[i].vbo );
+		if( s_mesh_cache[i].ibo ) pglDeleteBuffersARB( 1, &s_mesh_cache[i].ibo );
+	}
+	memset( s_mesh_cache, 0, sizeof( s_mesh_cache ));
+	s_mesh_cache_used = 0;
+
+	R_StudioFreeStreamBuffers();
+	R_StudioFreeGPUMeshCache();
+}
+
+/*
+ * R_StudioBuildMeshCache
+ * Converts the current arrayverts/arraycoord/arraycolor/arrayelems into a
+ * persistent VBO+IBO and stores it in the cache.
+ * Only called when r_studio_meshcache is enabled and GL_ARB_VERTEX_BUFFER_OBJECT_EXT
+ * is available.
+ */
+static studio_mesh_cache_t *R_StudioBuildMeshCache( const mstudiomodel_t *sub,
+                                                     uint32_t mkey,
+                                                     uint startverts, uint startelems,
+                                                     uint numverts, uint numelems )
+{
+	studio_mesh_cache_t *slot;
+
+	if( !GL_Support( GL_ARB_VERTEX_BUFFER_OBJECT_EXT ))
+		return NULL;
+
+	if( numelems == 0 || numverts == 0 )
+		return NULL;
+
+	slot = R_StudioMeshCacheAlloc( sub, mkey );
+
+	// Build an interleaved vertex buffer: [pos(12) + uv(8) + color(4)] = 24 bytes
+	{
+		typedef struct { float x, y, z, s, t; GLubyte r, g, b, a; } studiovert_t;
+		studiovert_t *buf = (studiovert_t *)Mem_Malloc( r_temppool, numverts * sizeof( studiovert_t ));
+		uint i;
+
+		for( i = 0; i < numverts; i++ )
+		{
+			buf[i].x = g_studio.arrayverts[startverts + i][0];
+			buf[i].y = g_studio.arrayverts[startverts + i][1];
+			buf[i].z = g_studio.arrayverts[startverts + i][2];
+			buf[i].s = g_studio.arraycoord[startverts + i][0];
+			buf[i].t = g_studio.arraycoord[startverts + i][1];
+			buf[i].r = g_studio.arraycolor[startverts + i][0];
+			buf[i].g = g_studio.arraycolor[startverts + i][1];
+			buf[i].b = g_studio.arraycolor[startverts + i][2];
+			buf[i].a = g_studio.arraycolor[startverts + i][3];
+		}
+
+		pglGenBuffersARB( 1, &slot->vbo );
+		pglBindBufferARB( GL_ARRAY_BUFFER_ARB, slot->vbo );
+		pglBufferDataARB( GL_ARRAY_BUFFER_ARB, numverts * sizeof( studiovert_t ), buf, GL_STATIC_DRAW_ARB );
+		pglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
+		Mem_Free( buf );
+	}
+
+	// IBO
+	{
+		pglGenBuffersARB( 1, &slot->ibo );
+		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, slot->ibo );
+		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB,
+		                  numelems * sizeof( unsigned short ),
+		                  &g_studio.arrayelems[startelems], GL_STATIC_DRAW_ARB );
+		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+	}
+
+	slot->num_verts = numverts;
+	slot->num_elems = numelems;
+	slot->valid     = true;
+	return slot;
+}
+
+/*
+ * R_StudioDrawCachedMesh
+ * Draw a mesh from VBO/IBO.  Stride layout matches R_StudioBuildMeshCache.
+ */
+static void R_StudioDrawCachedMesh( const studio_mesh_cache_t *slot )
+{
+	// stride: float3 pos + float2 uv + ubyte4 color = 24 bytes
+	const GLsizei stride = (GLsizei)(3 * sizeof(float) + 2 * sizeof(float) + 4 * sizeof(GLubyte));
+
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, slot->vbo );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, slot->ibo );
+
+	pglEnableClientState( GL_VERTEX_ARRAY );
+	pglVertexPointer( 3, GL_FLOAT, stride, (void*)0 );
+
+	pglEnableClientState( GL_TEXTURE_COORD_ARRAY );
+	pglTexCoordPointer( 2, GL_FLOAT, stride, (void*)(3 * sizeof(float)) );
+
+	if( !( g_nForceFaceFlags & STUDIO_NF_CHROME ))
+	{
+		pglEnableClientState( GL_COLOR_ARRAY );
+		pglColorPointer( 4, GL_UNSIGNED_BYTE, stride,
+		                 (void*)(3 * sizeof(float) + 2 * sizeof(float)) );
+	}
+
+	if( pglDrawRangeElements )
+		pglDrawRangeElements( GL_TRIANGLES, 0, slot->num_verts - 1,
+		                      slot->num_elems, GL_UNSIGNED_SHORT, (void*)0 );
+	else
+		pglDrawElements( GL_TRIANGLES, slot->num_elems, GL_UNSIGNED_SHORT, (void*)0 );
+
+	pglDisableClientState( GL_VERTEX_ARRAY );
+	pglDisableClientState( GL_TEXTURE_COORD_ARRAY );
+	if( !( g_nForceFaceFlags & STUDIO_NF_CHROME ))
+		pglDisableClientState( GL_COLOR_ARRAY );
+
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+}
+
+/*
+ * R_StudioFreeStreamBuffers
+ * Frees safe dynamic VBO/IBO stream buffers used for animated Studio meshes.
+ */
+static void R_StudioFreeStreamBuffers( void )
+{
+	if( s_stream_vbo )
+	{
+		pglDeleteBuffersARB( 1, &s_stream_vbo );
+		s_stream_vbo = 0;
+	}
+
+	if( s_stream_ibo )
+	{
+		pglDeleteBuffersARB( 1, &s_stream_ibo );
+		s_stream_ibo = 0;
+	}
+}
+
+static qboolean R_StudioEnsureStreamBuffers( void )
+{
+	if( !GL_Support( GL_ARB_VERTEX_BUFFER_OBJECT_EXT ))
+		return false;
+
+	if( !pglGenBuffersARB || !pglBindBufferARB || !pglBufferDataARB )
+		return false;
+
+	if( !s_stream_vbo )
+		pglGenBuffersARB( 1, &s_stream_vbo );
+	if( !s_stream_ibo )
+		pglGenBuffersARB( 1, &s_stream_ibo );
+
+	return ( s_stream_vbo != 0 && s_stream_ibo != 0 ) ? true : false;
+}
+
+/*
+ * R_StudioDrawStreamVBO
+ * Safe RX 580 path: stream the current animated/skinned mesh to VBO/IBO.
+ * This is intentionally dynamic. It does not cache world-space vertices across frames,
+ * so movement and animation remain correct while still exercising the driver VBO path.
+ */
+static qboolean R_StudioDrawStreamVBO( uint startverts, uint startelems )
+{
+	uint i;
+	const uint numverts = g_studio.numverts - startverts;
+	const uint numelems = g_studio.numelems - startelems;
+	const GLsizei stride = (GLsizei)sizeof( studio_stream_vert_t );
+
+	if( !r_studio_meshcache.value )
+		return false;
+	if( !numverts || !numelems )
+		return false;
+	if( startverts >= g_studio.numverts || startelems >= g_studio.numelems )
+		return false;
+	if( numverts > MAXSTUDIOVERTS || numelems > MAXSTUDIOVERTS * 6 )
+		return false;
+	if( !R_StudioEnsureStreamBuffers() )
+		return false;
+
+	for( i = 0; i < numverts; i++ )
+	{
+		const uint src = startverts + i;
+		studio_stream_vert_t *dst = &s_stream_vertices[i];
+
+		dst->x = g_studio.arrayverts[src][0];
+		dst->y = g_studio.arrayverts[src][1];
+		dst->z = g_studio.arrayverts[src][2];
+		dst->s = g_studio.arraycoord[src][0];
+		dst->t = g_studio.arraycoord[src][1];
+		dst->r = g_studio.arraycolor[src][0];
+		dst->g = g_studio.arraycolor[src][1];
+		dst->b = g_studio.arraycolor[src][2];
+		dst->a = g_studio.arraycolor[src][3];
+	}
+
+	for( i = 0; i < numelems; i++ )
+	{
+		const unsigned short idx = g_studio.arrayelems[startelems + i];
+
+		if( idx < startverts || idx >= g_studio.numverts )
+			return false;
+
+		s_stream_indices[i] = (unsigned short)( idx - startverts );
+	}
+
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, s_stream_vbo );
+	pglBufferDataARB( GL_ARRAY_BUFFER_ARB,
+		(GLsizeiptrARB)( numverts * sizeof( studio_stream_vert_t )),
+		s_stream_vertices, GL_STREAM_DRAW_ARB );
+
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, s_stream_ibo );
+	pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB,
+		(GLsizeiptrARB)( numelems * sizeof( unsigned short )),
+		s_stream_indices, GL_STREAM_DRAW_ARB );
+
+	pglEnableClientState( GL_VERTEX_ARRAY );
+	pglVertexPointer( 3, GL_FLOAT, stride, (void*)0 );
+
+	pglEnableClientState( GL_TEXTURE_COORD_ARRAY );
+	pglTexCoordPointer( 2, GL_FLOAT, stride, (void*)( 3 * sizeof( float )) );
+
+	if( !( g_nForceFaceFlags & STUDIO_NF_CHROME ) )
+	{
+		pglEnableClientState( GL_COLOR_ARRAY );
+		pglColorPointer( 4, GL_UNSIGNED_BYTE, stride,
+			(void*)( 3 * sizeof( float ) + 2 * sizeof( float )) );
+	}
+
+#if !defined XASH_NANOGL || defined XASH_WES && XASH_EMSCRIPTEN
+	if( pglDrawRangeElements )
+		pglDrawRangeElements( GL_TRIANGLES, 0, numverts - 1,
+			numelems, GL_UNSIGNED_SHORT, (void*)0 );
+	else
+#endif
+		pglDrawElements( GL_TRIANGLES, numelems, GL_UNSIGNED_SHORT, (void*)0 );
+
+	pglDisableClientState( GL_VERTEX_ARRAY );
+	pglDisableClientState( GL_TEXTURE_COORD_ARRAY );
+	if( !( g_nForceFaceFlags & STUDIO_NF_CHROME ) )
+		pglDisableClientState( GL_COLOR_ARRAY );
+
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+	return true;
+}
+
+/*
+ * R_StudioPackBoneRows
+ * Pack g_studio.worldtransform into flat float vec4-rows for GPU skinning.
+ * Layout: s_bone_rows[bone*3+row][0..3] = row-vector of 3x4 matrix.
+ */
+static void R_StudioPackBoneRows( int numbones )
+{
+	int b, r;
+	for( b = 0; b < numbones; b++ )
+	{
+		for( r = 0; r < 3; r++ )
+		{
+			float *dst = s_bone_rows + (b * 3 + r) * 4;
+			dst[0] = g_studio.worldtransform[b][r][0];
+			dst[1] = g_studio.worldtransform[b][r][1];
+			dst[2] = g_studio.worldtransform[b][r][2];
+			dst[3] = g_studio.worldtransform[b][r][3];
+		}
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * Persistent model-space mesh cache + experimental GLSL uniform skinning
+ * ----------------------------------------------------------------------- */
+static void R_StudioFreeUniformShader( void )
+{
+	if( s_studio_uniform_shader.program )
+	{
+		if( pglUseProgramObjectARB ) pglUseProgramObjectARB( 0 );
+		if( pglDeleteObjectARB ) pglDeleteObjectARB( s_studio_uniform_shader.program );
+	}
+	if( s_studio_uniform_shader.vertex_shader && pglDeleteObjectARB )
+		pglDeleteObjectARB( s_studio_uniform_shader.vertex_shader );
+	if( s_studio_uniform_shader.fragment_shader && pglDeleteObjectARB )
+		pglDeleteObjectARB( s_studio_uniform_shader.fragment_shader );
+	memset( &s_studio_uniform_shader, 0, sizeof( s_studio_uniform_shader ));
+}
+
+static void R_StudioFreeGPUMeshCache( void )
+{
+	int i;
+	for( i = 0; i < s_gpu_mesh_cache_used; i++ )
+	{
+		if( s_gpu_mesh_cache[i].static_vbo ) pglDeleteBuffersARB( 1, &s_gpu_mesh_cache[i].static_vbo );
+		if( s_gpu_mesh_cache[i].static_ibo ) pglDeleteBuffersARB( 1, &s_gpu_mesh_cache[i].static_ibo );
+	}
+	memset( s_gpu_mesh_cache, 0, sizeof( s_gpu_mesh_cache ));
+	s_gpu_mesh_cache_used = 0;
+	R_StudioFreeUniformShader();
+}
+
+static uint32_t R_StudioMakeCacheTag( const studiohdr_t *hdr, const mstudiomodel_t *sub, const mstudiomesh_t *mesh, int skinref, int flags )
+{
+	uintptr_t h = (uintptr_t)hdr;
+	uintptr_t s = (uintptr_t)sub;
+	uintptr_t m = (uintptr_t)mesh;
+	uint32_t tag = (uint32_t)((h >> 4) ^ (s >> 7) ^ (m >> 10));
+	tag ^= (uint32_t)( skinref * 1315423911u );
+	tag ^= (uint32_t)( flags * 2654435761u );
+	return tag;
+}
+
+static studio_gpu_mesh_t *R_StudioFindGPUMesh( const studiohdr_t *hdr, const mstudiomodel_t *sub, const mstudiomesh_t *mesh, int skinref, int flags )
+{
+	uint32_t tag = R_StudioMakeCacheTag( hdr, sub, mesh, skinref, flags );
+	int i;
+	for( i = 0; i < s_gpu_mesh_cache_used; i++ )
+	{
+		studio_gpu_mesh_t *c = &s_gpu_mesh_cache[i];
+		if( c->valid && c->header == hdr && c->submodel == sub && c->mesh == mesh && c->skinref == skinref && c->flags == flags && c->cache_tag == tag )
+			return c;
+	}
+	return NULL;
+}
+
+static studio_gpu_mesh_t *R_StudioAllocGPUMesh( const studiohdr_t *hdr, const mstudiomodel_t *sub, const mstudiomesh_t *mesh, int skinref, int flags )
+{
+	studio_gpu_mesh_t *slot;
+	if( s_gpu_mesh_cache_used < STUDIO_GPU_MESH_CACHE_SIZE )
+		slot = &s_gpu_mesh_cache[s_gpu_mesh_cache_used++];
+	else
+	{
+		slot = &s_gpu_mesh_cache[0];
+		if( slot->static_vbo ) pglDeleteBuffersARB( 1, &slot->static_vbo );
+		if( slot->static_ibo ) pglDeleteBuffersARB( 1, &slot->static_ibo );
+		memmove( &s_gpu_mesh_cache[0], &s_gpu_mesh_cache[1], ( STUDIO_GPU_MESH_CACHE_SIZE - 1 ) * sizeof( studio_gpu_mesh_t ));
+		slot = &s_gpu_mesh_cache[STUDIO_GPU_MESH_CACHE_SIZE - 1];
+	}
+	memset( slot, 0, sizeof( *slot ));
+	slot->header = hdr;
+	slot->submodel = sub;
+	slot->mesh = mesh;
+	slot->skinref = skinref;
+	slot->flags = flags;
+	slot->cache_tag = R_StudioMakeCacheTag( hdr, sub, mesh, skinref, flags );
+	return slot;
+}
+
+static qboolean R_StudioStaticIndexAppend( qboolean tri_strip, int *vertexState, uint curvert, unsigned short *indices, uint *numelems, uint maxelems )
+{
+	const int oldState = *vertexState;
+	const int newState = oldState + 1;
+	if( oldState < 3 )
+	{
+		if( *numelems + 1 > maxelems ) return false;
+		indices[(*numelems)++] = (unsigned short)curvert;
+	}
+	else if( tri_strip )
+	{
+		if( *numelems + 3 > maxelems ) return false;
+		if( newState & 1 )
+		{
+			indices[(*numelems)++] = (unsigned short)( curvert - 2 );
+			indices[(*numelems)++] = (unsigned short)( curvert - 1 );
+			indices[(*numelems)++] = (unsigned short)curvert;
+		}
+		else
+		{
+			indices[(*numelems)++] = (unsigned short)( curvert - 1 );
+			indices[(*numelems)++] = (unsigned short)( curvert - 2 );
+			indices[(*numelems)++] = (unsigned short)curvert;
+		}
+	}
+	else
+	{
+		if( *numelems + 3 > maxelems ) return false;
+		indices[(*numelems)++] = (unsigned short)( curvert - ( newState - 1 ));
+		indices[(*numelems)++] = (unsigned short)( curvert - 1 );
+		indices[(*numelems)++] = (unsigned short)curvert;
+	}
+	*vertexState = newState;
+	return true;
+}
+
+static void R_StudioFillBoneWeight( studio_static_vertex_t *dst, int vindex, byte *pvertbone, mstudioboneweight_t *pvertweight )
+{
+	int i;
+	memset( dst->bone, 0, sizeof( dst->bone ));
+	memset( dst->weight, 0, sizeof( dst->weight ));
+
+	if( pvertweight )
+	{
+		for( i = 0; i < MAXSTUDIOBONEWEIGHTS && i < 4; i++ )
+		{
+			if( pvertweight[vindex].bone[i] < 0 )
+				break;
+			dst->bone[i] = (GLubyte)pvertweight[vindex].bone[i];
+			dst->weight[i] = (GLubyte)pvertweight[vindex].weight[i];
+		}
+		if( dst->weight[0] == 0 && dst->weight[1] == 0 && dst->weight[2] == 0 && dst->weight[3] == 0 )
+			dst->weight[0] = 255;
+	}
+	else
+	{
+		dst->bone[0] = pvertbone ? (GLubyte)pvertbone[vindex] : 0;
+		dst->weight[0] = 255;
+	}
+}
+
+static studio_gpu_mesh_t *R_StudioBuildModelSpaceMesh( mstudiomesh_t *pmesh, int skinref, int flags, float s, float t,
+	vec3_t *pstudioverts, vec3_t *pstudionorms, byte *pvertbone, mstudioboneweight_t *pvertweight )
+{
+	short *ptricmds;
+	studio_static_vertex_t *verts;
+	unsigned short *indices;
+	studio_gpu_mesh_t *slot;
+	uint numverts = 0, numelems = 0;
+	uint maxverts = 0, maxelems = 0;
+	int i;
+
+	if( !GL_Support( GL_ARB_VERTEX_BUFFER_OBJECT_EXT ) || !pglGenBuffersARB || !pglBindBufferARB || !pglBufferDataARB )
+		return NULL;
+
+	ptricmds = (short *)((byte *)m_pStudioHeader + pmesh->triindex);
+	while(( i = *( ptricmds++ )))
+	{
+		if( i < 0 ) i = -i;
+		maxverts += i;
+		if( i >= 3 ) maxelems += 3 + ( i - 3 ) * 3;
+		ptricmds += i * 4;
+	}
+
+	if( maxverts == 0 || maxelems == 0 || maxverts > MAXSTUDIOVERTS || maxelems > MAXSTUDIOVERTS * 6 )
+		return NULL;
+
+	verts = (studio_static_vertex_t *)Mem_Malloc( r_temppool, maxverts * sizeof( studio_static_vertex_t ));
+	indices = (unsigned short *)Mem_Malloc( r_temppool, maxelems * sizeof( unsigned short ));
+	if( !verts || !indices )
+	{
+		if( verts ) Mem_Free( verts );
+		if( indices ) Mem_Free( indices );
+		return NULL;
+	}
+
+	ptricmds = (short *)((byte *)m_pStudioHeader + pmesh->triindex);
+	while(( i = *( ptricmds++ )))
+	{
+		int vertexState = 0;
+		qboolean tri_strip = true;
+		if( i < 0 )
+		{
+			tri_strip = false;
+			i = -i;
+		}
+
+		for( ; i > 0; i--, ptricmds += 4 )
+		{
+			int vindex = ptricmds[0];
+			int nindex = ptricmds[1];
+			studio_static_vertex_t *dst;
+
+			if( numverts >= maxverts ) break;
+			if( !R_StudioStaticIndexAppend( tri_strip, &vertexState, numverts, indices, &numelems, maxelems )) break;
+
+			dst = &verts[numverts];
+			VectorCopy( pstudioverts[vindex], dst->pos );
+			VectorCopy( pstudionorms[nindex], dst->normal );
+			if( FBitSet( flags, STUDIO_NF_UV_COORDS ))
+			{
+				dst->st[0] = HalfToFloat( ptricmds[2] );
+				dst->st[1] = HalfToFloat( ptricmds[3] );
+			}
+			else
+			{
+				dst->st[0] = ptricmds[2] * s;
+				dst->st[1] = ptricmds[3] * t;
+			}
+			R_StudioFillBoneWeight( dst, vindex, pvertbone, pvertweight );
+			numverts++;
+		}
+	}
+
+	if( numverts == 0 || numelems == 0 )
+	{
+		Mem_Free( verts );
+		Mem_Free( indices );
+		return NULL;
+	}
+
+	slot = R_StudioAllocGPUMesh( m_pStudioHeader, m_pSubModel, pmesh, skinref, flags );
+	pglGenBuffersARB( 1, &slot->static_vbo );
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, slot->static_vbo );
+	pglBufferDataARB( GL_ARRAY_BUFFER_ARB, (GLsizeiptrARB)( numverts * sizeof( studio_static_vertex_t )), verts, GL_STATIC_DRAW_ARB );
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
+
+	pglGenBuffersARB( 1, &slot->static_ibo );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, slot->static_ibo );
+	pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, (GLsizeiptrARB)( numelems * sizeof( unsigned short )), indices, GL_STATIC_DRAW_ARB );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+
+	slot->num_vertices = numverts;
+	slot->num_indices = numelems;
+	slot->layout_flags = 0;
+	slot->valid = true;
+
+	Mem_Free( verts );
+	Mem_Free( indices );
+	return slot;
+}
+
+static studio_gpu_mesh_t *R_StudioGetModelSpaceMesh( mstudiomesh_t *pmesh, int skinref, int flags, float s, float t,
+	vec3_t *pstudioverts, vec3_t *pstudionorms, byte *pvertbone, mstudioboneweight_t *pvertweight )
+{
+	studio_gpu_mesh_t *slot = R_StudioFindGPUMesh( m_pStudioHeader, m_pSubModel, pmesh, skinref, flags );
+	if( slot ) return slot;
+	return R_StudioBuildModelSpaceMesh( pmesh, skinref, flags, s, t, pstudioverts, pstudionorms, pvertbone, pvertweight );
+}
+
+static const char *studio_gpu_vs =
+"#version 110\n"
+"attribute vec3 a_Position;\n"
+"attribute vec3 a_Normal;\n"
+"attribute vec2 a_TexCoord0;\n"
+"attribute vec4 a_BoneIndex;\n"
+"attribute vec4 a_BoneWeight;\n"
+"uniform vec4 u_BoneRows[384];\n"
+"uniform vec3 u_LightDir;\n"
+"uniform vec3 u_Ambient;\n"
+"uniform vec3 u_Diffuse;\n"
+"varying vec2 v_TexCoord;\n"
+"varying vec4 v_Color;\n"
+"vec3 bonePos(int bone, vec4 p){ vec4 r0=u_BoneRows[bone*3+0]; vec4 r1=u_BoneRows[bone*3+1]; vec4 r2=u_BoneRows[bone*3+2]; return vec3(dot(r0,p),dot(r1,p),dot(r2,p)); }\n"
+"vec3 boneDir(int bone, vec3 n){ vec4 r0=u_BoneRows[bone*3+0]; vec4 r1=u_BoneRows[bone*3+1]; vec4 r2=u_BoneRows[bone*3+2]; return vec3(dot(r0.xyz,n),dot(r1.xyz,n),dot(r2.xyz,n)); }\n"
+"void main(void){\n"
+" vec4 p=vec4(a_Position,1.0);\n"
+" int b0=int(a_BoneIndex.x); int b1=int(a_BoneIndex.y); int b2=int(a_BoneIndex.z); int b3=int(a_BoneIndex.w);\n"
+" vec3 sp=bonePos(b0,p)*a_BoneWeight.x + bonePos(b1,p)*a_BoneWeight.y + bonePos(b2,p)*a_BoneWeight.z + bonePos(b3,p)*a_BoneWeight.w;\n"
+" vec3 sn=boneDir(b0,a_Normal)*a_BoneWeight.x + boneDir(b1,a_Normal)*a_BoneWeight.y + boneDir(b2,a_Normal)*a_BoneWeight.z + boneDir(b3,a_Normal)*a_BoneWeight.w;\n"
+" sn=normalize(sn); float ndl=max(dot(sn, normalize(u_LightDir)), 0.0);\n"
+" v_Color=vec4(u_Ambient + u_Diffuse * ndl, 1.0); v_TexCoord=a_TexCoord0;\n"
+" gl_Position=gl_ModelViewProjectionMatrix * vec4(sp,1.0);\n"
+"}\n";
+
+static const char *studio_gpu_fs =
+"#version 110\n"
+"uniform sampler2D u_Texture0;\n"
+"varying vec2 v_TexCoord;\n"
+"varying vec4 v_Color;\n"
+"void main(void){ gl_FragColor = texture2D(u_Texture0, v_TexCoord) * v_Color; }\n";
+
+static GLhandleARB R_StudioCompileShaderObject( GLenum type, const char *source )
+{
+	GLhandleARB obj;
+	GLint ok = 0;
+	if( !pglCreateShaderObjectARB || !pglShaderSourceARB || !pglCompileShaderARB || !pglGetObjectParameterivARB ) return 0;
+	obj = pglCreateShaderObjectARB( type );
+	if( !obj ) return 0;
+	pglShaderSourceARB( obj, 1, &source, NULL );
+	pglCompileShaderARB( obj );
+	pglGetObjectParameterivARB( obj, GL_OBJECT_COMPILE_STATUS_ARB, &ok );
+	if( !ok ) { if( pglDeleteObjectARB ) pglDeleteObjectARB( obj ); return 0; }
+	return obj;
+}
+
+static qboolean R_StudioEnsureUniformShader( void )
+{
+	GLint ok = 0;
+	if( s_studio_uniform_shader.ready ) return true;
+	if( s_studio_uniform_shader.failed ) return false;
+	if( !GL_Support( GL_SHADER_OBJECTS_EXT ) || !GL_Support( GL_SHADER_GLSL100_EXT )) { s_studio_uniform_shader.failed = true; return false; }
+	if( !pglCreateProgramObjectARB || !pglAttachObjectARB || !pglLinkProgramARB || !pglUseProgramObjectARB ) { s_studio_uniform_shader.failed = true; return false; }
+	s_studio_uniform_shader.vertex_shader = R_StudioCompileShaderObject( GL_VERTEX_SHADER_ARB, studio_gpu_vs );
+	s_studio_uniform_shader.fragment_shader = R_StudioCompileShaderObject( GL_FRAGMENT_SHADER_ARB, studio_gpu_fs );
+	if( !s_studio_uniform_shader.vertex_shader || !s_studio_uniform_shader.fragment_shader ) { R_StudioFreeUniformShader(); s_studio_uniform_shader.failed = true; return false; }
+	s_studio_uniform_shader.program = pglCreateProgramObjectARB();
+	pglAttachObjectARB( s_studio_uniform_shader.program, s_studio_uniform_shader.vertex_shader );
+	pglAttachObjectARB( s_studio_uniform_shader.program, s_studio_uniform_shader.fragment_shader );
+	if( pglBindAttribLocationARB )
+	{
+		pglBindAttribLocationARB( s_studio_uniform_shader.program, 0, "a_Position" );
+		pglBindAttribLocationARB( s_studio_uniform_shader.program, 1, "a_Normal" );
+		pglBindAttribLocationARB( s_studio_uniform_shader.program, 2, "a_TexCoord0" );
+		pglBindAttribLocationARB( s_studio_uniform_shader.program, 3, "a_BoneIndex" );
+		pglBindAttribLocationARB( s_studio_uniform_shader.program, 4, "a_BoneWeight" );
+	}
+	pglLinkProgramARB( s_studio_uniform_shader.program );
+	pglGetObjectParameterivARB( s_studio_uniform_shader.program, GL_OBJECT_LINK_STATUS_ARB, &ok );
+	if( !ok ) { R_StudioFreeUniformShader(); s_studio_uniform_shader.failed = true; return false; }
+	s_studio_uniform_shader.a_position = pglGetAttribLocationARB ? pglGetAttribLocationARB( s_studio_uniform_shader.program, "a_Position" ) : 0;
+	s_studio_uniform_shader.a_normal = pglGetAttribLocationARB ? pglGetAttribLocationARB( s_studio_uniform_shader.program, "a_Normal" ) : 1;
+	s_studio_uniform_shader.a_texcoord0 = pglGetAttribLocationARB ? pglGetAttribLocationARB( s_studio_uniform_shader.program, "a_TexCoord0" ) : 2;
+	s_studio_uniform_shader.a_bone_index = pglGetAttribLocationARB ? pglGetAttribLocationARB( s_studio_uniform_shader.program, "a_BoneIndex" ) : 3;
+	s_studio_uniform_shader.a_bone_weight = pglGetAttribLocationARB ? pglGetAttribLocationARB( s_studio_uniform_shader.program, "a_BoneWeight" ) : 4;
+	s_studio_uniform_shader.u_bone_rows = pglGetUniformLocationARB ? pglGetUniformLocationARB( s_studio_uniform_shader.program, "u_BoneRows" ) : -1;
+	s_studio_uniform_shader.u_light_dir = pglGetUniformLocationARB ? pglGetUniformLocationARB( s_studio_uniform_shader.program, "u_LightDir" ) : -1;
+	s_studio_uniform_shader.u_ambient = pglGetUniformLocationARB ? pglGetUniformLocationARB( s_studio_uniform_shader.program, "u_Ambient" ) : -1;
+	s_studio_uniform_shader.u_diffuse = pglGetUniformLocationARB ? pglGetUniformLocationARB( s_studio_uniform_shader.program, "u_Diffuse" ) : -1;
+	s_studio_uniform_shader.u_texture0 = pglGetUniformLocationARB ? pglGetUniformLocationARB( s_studio_uniform_shader.program, "u_Texture0" ) : -1;
+	s_studio_uniform_shader.ready = true;
+	return true;
+}
+
+static studio_skin_backend_t R_StudioSelectSkinBackend( void )
+{
+	int requested = 1;
+	if( !r_studio_gpu_skinning.value ) return STUDIO_SKIN_CPU;
+	requested = (int)gl_studio_skin_backend.value;
+	if( requested <= 0 ) requested = STUDIO_SKIN_GPU_UNIFORM;
+	if( requested == STUDIO_SKIN_GPU_TBO || requested == STUDIO_SKIN_GPU_SSBO ) requested = STUDIO_SKIN_GPU_UNIFORM;
+	return (studio_skin_backend_t)requested;
+}
+
+static qboolean R_StudioShouldUseGPUUniformPath( int flags )
+{
+	(void)flags;
+
+	/* Rescue/stability build:
+	 * keep the GLSL/TBO/SSBO preparation code in the file, but never dispatch it yet.
+	 * The previous fullprep version could report success from the shader path and skip
+	 * the proven CPU Studio path, causing players/viewmodels/world Studio props to vanish.
+	 * Re-enable this only after the shader path is split into a separate tested file.
+	 */
+	return false;
+}
+
+static qboolean R_StudioTryDrawGPUUniformMesh( mstudiomesh_t *pmesh, int skinref, int flags, float s, float t,
+	vec3_t *pstudioverts, vec3_t *pstudionorms, byte *pvertbone, mstudioboneweight_t *pvertweight )
+{
+	studio_gpu_mesh_t *mesh;
+	const GLsizei stride = (GLsizei)sizeof( studio_static_vertex_t );
+	vec3_t lightdir, ambient, diffuse;
+	if( !R_StudioShouldUseGPUUniformPath( flags )) return false;
+	mesh = R_StudioGetModelSpaceMesh( pmesh, skinref, flags, s, t, pstudioverts, pstudionorms, pvertbone, pvertweight );
+	if( !mesh || !mesh->valid || !mesh->static_vbo || !mesh->static_ibo ) return false;
+	VectorCopy( g_studio.lightvec, lightdir );
+	if( VectorIsNull( lightdir )) VectorSet( lightdir, 0.0f, 0.0f, 1.0f );
+	VectorNormalize( lightdir );
+	VectorScale( g_studio.lightcolor, Q_max( 0.05f, g_studio.ambientlight ), ambient );
+	VectorScale( g_studio.lightcolor, Q_max( 0.25f, g_studio.shadelight ), diffuse );
+	pglUseProgramObjectARB( s_studio_uniform_shader.program );
+	if( s_studio_uniform_shader.u_texture0 >= 0 ) pglUniform1iARB( s_studio_uniform_shader.u_texture0, 0 );
+	if( s_studio_uniform_shader.u_light_dir >= 0 ) pglUniform3fvARB( s_studio_uniform_shader.u_light_dir, 1, lightdir );
+	if( s_studio_uniform_shader.u_ambient >= 0 ) pglUniform3fvARB( s_studio_uniform_shader.u_ambient, 1, ambient );
+	if( s_studio_uniform_shader.u_diffuse >= 0 ) pglUniform3fvARB( s_studio_uniform_shader.u_diffuse, 1, diffuse );
+	if( s_studio_uniform_shader.u_bone_rows >= 0 ) pglUniform4fvARB( s_studio_uniform_shader.u_bone_rows, m_pStudioHeader->numbones * 3, s_bone_rows );
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, mesh->static_vbo );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, mesh->static_ibo );
+	pglEnableVertexAttribArrayARB( s_studio_uniform_shader.a_position );
+	pglVertexAttribPointerARB( s_studio_uniform_shader.a_position, 3, GL_FLOAT, GL_FALSE, stride, (void *)STUDIO_OFFSETOF( studio_static_vertex_t, pos ));
+	pglEnableVertexAttribArrayARB( s_studio_uniform_shader.a_normal );
+	pglVertexAttribPointerARB( s_studio_uniform_shader.a_normal, 3, GL_FLOAT, GL_FALSE, stride, (void *)STUDIO_OFFSETOF( studio_static_vertex_t, normal ));
+	pglEnableVertexAttribArrayARB( s_studio_uniform_shader.a_texcoord0 );
+	pglVertexAttribPointerARB( s_studio_uniform_shader.a_texcoord0, 2, GL_FLOAT, GL_FALSE, stride, (void *)STUDIO_OFFSETOF( studio_static_vertex_t, st ));
+	pglEnableVertexAttribArrayARB( s_studio_uniform_shader.a_bone_index );
+	pglVertexAttribPointerARB( s_studio_uniform_shader.a_bone_index, 4, GL_UNSIGNED_BYTE, GL_FALSE, stride, (void *)STUDIO_OFFSETOF( studio_static_vertex_t, bone ));
+	pglEnableVertexAttribArrayARB( s_studio_uniform_shader.a_bone_weight );
+	pglVertexAttribPointerARB( s_studio_uniform_shader.a_bone_weight, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void *)STUDIO_OFFSETOF( studio_static_vertex_t, weight ));
+#if !defined XASH_NANOGL || defined XASH_WES && XASH_EMSCRIPTEN
+	if( pglDrawRangeElements ) pglDrawRangeElements( GL_TRIANGLES, 0, mesh->num_vertices - 1, mesh->num_indices, GL_UNSIGNED_SHORT, (void *)0 );
+	else
+#endif
+		pglDrawElements( GL_TRIANGLES, mesh->num_indices, GL_UNSIGNED_SHORT, (void *)0 );
+	pglDisableVertexAttribArrayARB( s_studio_uniform_shader.a_position );
+	pglDisableVertexAttribArrayARB( s_studio_uniform_shader.a_normal );
+	pglDisableVertexAttribArrayARB( s_studio_uniform_shader.a_texcoord0 );
+	pglDisableVertexAttribArrayARB( s_studio_uniform_shader.a_bone_index );
+	pglDisableVertexAttribArrayARB( s_studio_uniform_shader.a_bone_weight );
+	pglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
+	pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+	pglUseProgramObjectARB( 0 );
+	return true;
+}
+
 static void R_StudioDrawArrays( uint startverts, uint startelems )
 {
+	const uint count = g_studio.numelems - startelems;
+	const uint endverts = g_studio.numverts ? g_studio.numverts - 1 : 0;
+
+	if( !count || startverts >= g_studio.numverts )
+		return;
+
+	/* Ensure the fixed-function/client-array Studio path is not affected by a
+	 * previously bound experimental shader. This is harmless when shaders are absent.
+	 */
+	if( pglUseProgramObjectARB )
+		pglUseProgramObjectARB( 0 );
+
 	pglEnableClientState( GL_VERTEX_ARRAY );
 	pglVertexPointer( 3, GL_FLOAT, 12, g_studio.arrayverts );
 
@@ -2209,11 +3141,11 @@ static void R_StudioDrawArrays( uint startverts, uint startelems )
 
 #if !defined XASH_NANOGL || defined XASH_WES && XASH_EMSCRIPTEN // WebGL need to know array sizes
 	if( pglDrawRangeElements )
-		pglDrawRangeElements( GL_TRIANGLES, startverts, g_studio.numverts,
-			g_studio.numelems - startelems, GL_UNSIGNED_SHORT, &g_studio.arrayelems[startelems] );
+		pglDrawRangeElements( GL_TRIANGLES, startverts, endverts,
+			count, GL_UNSIGNED_SHORT, &g_studio.arrayelems[startelems] );
 	else
 #endif
-		pglDrawElements( GL_TRIANGLES, g_studio.numelems - startelems, GL_UNSIGNED_SHORT, &g_studio.arrayelems[startelems] );
+		pglDrawElements( GL_TRIANGLES, count, GL_UNSIGNED_SHORT, &g_studio.arrayelems[startelems] );
 	pglDisableClientState( GL_VERTEX_ARRAY );
 	pglDisableClientState( GL_TEXTURE_COORD_ARRAY );
 	if( !( g_nForceFaceFlags & STUDIO_NF_CHROME ) )
@@ -2233,6 +3165,8 @@ static void R_StudioDrawPoints( void )
 	qboolean		need_sort = false;
 	byte		*pvertbone;
 	byte		*pnormbone;
+	mstudioboneweight_t	*pvertweight = NULL;
+	mstudioboneweight_t	*pnormweight = NULL;
 	vec3_t		*pstudioverts;
 	vec3_t		*pstudionorms;
 	mstudiotexture_t	*ptexture;
@@ -2240,12 +3174,12 @@ static void R_StudioDrawPoints( void )
 	short		*pskinref;
 	float		lv_tmp;
 
-	if( !m_pStudioHeader ) return;
-
+	if( !m_pStudioHeader || !m_pSubModel ) return;
 
 	g_studio.numverts = g_studio.numelems = 0;
 
 	m_skinnum = RI.currententity->curstate.skin;
+	if( m_skinnum < 0 ) m_skinnum = 0;
 	ptexture = (mstudiotexture_t *)((byte *)m_pStudioHeader + m_pStudioHeader->textureindex);
 	pvertbone = ((byte *)m_pStudioHeader + m_pSubModel->vertinfoindex);
 	pnormbone = ((byte *)m_pStudioHeader + m_pSubModel->norminfoindex);
@@ -2260,9 +3194,10 @@ static void R_StudioDrawPoints( void )
 
 	if( FBitSet( m_pStudioHeader->flags, STUDIO_HAS_BONEWEIGHTS ) && m_pSubModel->blendvertinfoindex != 0 && m_pSubModel->blendnorminfoindex != 0 )
 	{
-		mstudioboneweight_t	*pvertweight = (mstudioboneweight_t *)((byte *)m_pStudioHeader + m_pSubModel->blendvertinfoindex);
-		mstudioboneweight_t	*pnormweight = (mstudioboneweight_t *)((byte *)m_pStudioHeader + m_pSubModel->blendnorminfoindex);
 		matrix3x4		skinMat;
+
+		pvertweight = (mstudioboneweight_t *)((byte *)m_pStudioHeader + m_pSubModel->blendvertinfoindex);
+		pnormweight = (mstudioboneweight_t *)((byte *)m_pStudioHeader + m_pSubModel->blendnorminfoindex);
 
 		for( i = 0; i < m_pSubModel->numverts; i++ )
 		{
@@ -2302,6 +3237,8 @@ static void R_StudioDrawPoints( void )
 		// fill in sortedmesh info
 		g_studio.meshes[j].flags = g_nFaceFlags;
 		g_studio.meshes[j].mesh = &pmesh[j];
+		g_studio.meshes[j].skinref = pskinref[pmesh[j].skinref];
+		g_studio.meshes[j].sortkey = R_StudioMeshSortKey( g_nFaceFlags, g_studio.meshes[j].skinref );
 
 		if( FBitSet( g_nFaceFlags, STUDIO_NF_MASKED|STUDIO_NF_ADDITIVE ))
 			need_sort = true;
@@ -2330,11 +3267,16 @@ static void R_StudioDrawPoints( void )
 		}
 	}
 
-	if( r_studio_sort_textures.value && need_sort )
+	if(( r_studio_sort_textures.value && need_sort ) || ( r_studio_batch_sort.value && m_pSubModel->nummesh > 1 ))
 	{
-		// resort opaque and translucent meshes draw order
+		// resort meshes to reduce GL state churn:
+		// opaque -> masked -> additive, then by resolved material/skin reference.
 		qsort( g_studio.meshes, m_pSubModel->nummesh, sizeof( sortedmesh_t ), R_StudioMeshCompare );
 	}
+
+	// Pack bone rows for GPU skinning path (no-op cost if shader not active yet)
+	if( r_studio_gpu_skinning.value && m_pStudioHeader )
+		R_StudioPackBoneRows( m_pStudioHeader->numbones );
 
 	// NOTE: rewind normals at start
 	pstudionorms = (vec3_t *)((byte *)m_pStudioHeader + m_pSubModel->normindex);
@@ -2391,13 +3333,33 @@ static void R_StudioDrawPoints( void )
 
 		if( r_studio_drawelements.value )
 		{
-			if( FBitSet( g_nFaceFlags, STUDIO_NF_CHROME ))
-				R_StudioBuildArrayChromeMesh( ptricmds, pstudionorms, s, t, shellscale );
-			else if( FBitSet( g_nFaceFlags, STUDIO_NF_UV_COORDS ))
-				R_StudioBuildArrayFloatMesh( ptricmds, pstudionorms );
-			else R_StudioBuildArrayNormalMesh( ptricmds, pstudionorms, s, t );
+			qboolean drawnByGpuSkinning = false;
 
-			R_StudioDrawArrays( startArrayVerts, startArrayElems );
+			/* First try the real model-space GPU skinning path. It uses persistent
+			 * static VBO/IBO data and bone uniform rows, so it does not cache animated
+			 * world-space vertices and therefore cannot freeze animations. It is guarded
+			 * by r_studio_gpu_skinning and falls back to the legacy CPU path on failure. */
+			if( 0 && r_studio_gpu_skinning.value && shellscale <= 0.0f )
+				drawnByGpuSkinning = R_StudioTryDrawGPUUniformMesh( pmesh, pskinref[pmesh->skinref], g_nFaceFlags, s, t,
+					pstudioverts, pstudionorms, pvertbone, pvertweight );
+
+			if( !drawnByGpuSkinning )
+			{
+				// startArrayVerts/startArrayElems mark where THIS mesh begins in the arrays
+				if( FBitSet( g_nFaceFlags, STUDIO_NF_CHROME ))
+					R_StudioBuildArrayChromeMesh( ptricmds, pstudionorms, s, t, shellscale );
+				else if( FBitSet( g_nFaceFlags, STUDIO_NF_UV_COORDS ))
+					R_StudioBuildArrayFloatMesh( ptricmds, pstudionorms );
+				else R_StudioBuildArrayNormalMesh( ptricmds, pstudionorms, s, t );
+
+				/* Safe RX 580 path: stream animated/skinned arrays to VBO/IBO for this mesh.
+				 * Unlike the old static cache experiment, this does not persist world-space
+				 * vertices across frames, so animation and movement stay correct.
+				 * If anything is unsupported or invalid, fall back to original client arrays.
+				 */
+				if( !R_StudioDrawStreamVBO( startArrayVerts, startArrayElems ))
+					R_StudioDrawArrays( startArrayVerts, startArrayElems );
+			}
 		}
 		else
 		{

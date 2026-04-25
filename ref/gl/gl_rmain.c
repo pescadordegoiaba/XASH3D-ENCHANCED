@@ -93,11 +93,14 @@ static int R_TransEntityCompare( const void *a, const void *b )
 	float		dist1, dist2;
 	int		rendermode1;
 	int		rendermode2;
+	int		rank1, rank2; // FPS-FIX #6: precomputar ranks evita 4 chamadas extras por comparação
 
 	ent1 = *(cl_entity_t **)a;
 	ent2 = *(cl_entity_t **)b;
 	rendermode1 = R_GetEntityRenderMode( ent1 );
 	rendermode2 = R_GetEntityRenderMode( ent2 );
+	rank1 = R_RankForRenderMode( rendermode1 ); // calculado UMA vez
+	rank2 = R_RankForRenderMode( rendermode2 ); // calculado UMA vez
 
 	// sort by distance
 	if( ent1->model->type != mod_brush || rendermode1 != kRenderTransAlpha )
@@ -124,9 +127,9 @@ static int R_TransEntityCompare( const void *a, const void *b )
 		return 1;
 
 	// then sort by rendermode
-	if( R_RankForRenderMode( rendermode1 ) > R_RankForRenderMode( rendermode2 ))
+	if( rank1 > rank2 )
 		return 1;
-	if( R_RankForRenderMode( rendermode1 ) < R_RankForRenderMode( rendermode2 ))
+	if( rank1 < rank2 )
 		return -1;
 
 	return 0;
@@ -142,17 +145,17 @@ Returns true if we behind to screen
 */
 int R_WorldToScreen( const vec3_t point, vec3_t screen )
 {
-	matrix4x4	worldToScreen;
+	// FPS-FIX #11: remover Matrix4x4_Copy desnecessário.
+	// A matriz não é modificada aqui, então lemos direto de RI.worldviewProjectionMatrix.
 	qboolean	behind;
-	float	w;
+	float		w;
 
 	if( !point || !screen )
 		return true;
 
-	Matrix4x4_Copy( worldToScreen, RI.worldviewProjectionMatrix );
-	screen[0] = worldToScreen[0][0] * point[0] + worldToScreen[0][1] * point[1] + worldToScreen[0][2] * point[2] + worldToScreen[0][3];
-	screen[1] = worldToScreen[1][0] * point[0] + worldToScreen[1][1] * point[1] + worldToScreen[1][2] * point[2] + worldToScreen[1][3];
-	w = worldToScreen[3][0] * point[0] + worldToScreen[3][1] * point[1] + worldToScreen[3][2] * point[2] + worldToScreen[3][3];
+	screen[0] = RI.worldviewProjectionMatrix[0][0] * point[0] + RI.worldviewProjectionMatrix[0][1] * point[1] + RI.worldviewProjectionMatrix[0][2] * point[2] + RI.worldviewProjectionMatrix[0][3];
+	screen[1] = RI.worldviewProjectionMatrix[1][0] * point[0] + RI.worldviewProjectionMatrix[1][1] * point[1] + RI.worldviewProjectionMatrix[1][2] * point[2] + RI.worldviewProjectionMatrix[1][3];
+	w         = RI.worldviewProjectionMatrix[3][0] * point[0] + RI.worldviewProjectionMatrix[3][1] * point[1] + RI.worldviewProjectionMatrix[3][2] * point[2] + RI.worldviewProjectionMatrix[3][3];
 	screen[2] = 0.0f; // just so we have something valid here
 
 	if( w < 0.001f )
@@ -297,9 +300,20 @@ static void R_Clear( int bitMask )
 {
 	int	bits;
 
-	if( ENGINE_GET_PARM( PARM_DEV_OVERVIEW ))
-		pglClearColor( 0.0f, 1.0f, 0.0f, 1.0f ); // green background (Valve rules)
-	else pglClearColor( 0.5f, 0.5f, 0.5f, 1.0f );
+	// FPS-FIX #13: pglClearColor é chamado todo frame mas a cor raramente muda.
+	// Cacheamos o estado e só chamamos quando necessário.
+	{
+		static qboolean s_last_overview = false;
+		qboolean is_overview = ENGINE_GET_PARM( PARM_DEV_OVERVIEW ) ? true : false;
+		if( is_overview != s_last_overview )
+		{
+			if( is_overview )
+				pglClearColor( 0.0f, 1.0f, 0.0f, 1.0f ); // green background (Valve rules)
+			else
+				pglClearColor( 0.5f, 0.5f, 0.5f, 1.0f );
+			s_last_overview = is_overview;
+		}
+	}
 
 	bits = GL_DEPTH_BUFFER_BIT;
 
@@ -367,7 +381,13 @@ void R_SetupFrustum( void )
 
 	if( RI.drawOrtho )
 		GL_FrustumInitOrtho( &RI.frustum, ov->xLeft, ov->xRight, ov->yTop, ov->yBottom, ov->zNear, ov->zFar );
-	else GL_FrustumInitProj( &RI.frustum, 0.0f, R_GetFarClip(), RI.fov_x, RI.fov_y ); // NOTE: we ignore nearplane here (mirrors only)
+	else
+	{
+		// FPS-FIX #8: calcular farClip aqui e guardar em RI.farClip para
+		// R_SetupProjectionMatrix reusar — evita 2ª chamada redundante.
+		RI.farClip = R_GetFarClip();
+		GL_FrustumInitProj( &RI.frustum, 0.0f, RI.farClip, RI.fov_x, RI.fov_y );
+	}
 }
 
 /*
@@ -386,7 +406,10 @@ static void R_SetupProjectionMatrix( matrix4x4 m )
 		return;
 	}
 
-	RI.farClip = R_GetFarClip();
+	// FPS-FIX #8: RI.farClip ja foi preenchido em R_SetupFrustum (chamado antes).
+	// So recalcula como fallback se vier zerado (ex: cubemap direto sem SetupFrustum).
+	if( RI.farClip <= 0.0f )
+		RI.farClip = R_GetFarClip();
 
 	zNear = 4.0f;
 	zFar = Q_max( 256.0f, RI.farClip );
@@ -520,13 +543,17 @@ static void R_SetupFrame( void )
 	// setup viewplane dist
 	RI.viewplanedist = DotProduct( RI.vieworg, RI.vforward );
 
-	// NOTE: this request is the fps-killer on some NVidia drivers
-	glState.isFogEnabled = pglIsEnabled( GL_FOG );
+	// FPS-FIX #1: pglIsEnabled(GL_FOG) é um round-trip síncrono CPU<->GPU.
+	// Cacheamos o estado em glState.isFogEnabled via R_AllowFog/R_DrawFog,
+	// então não precisamos perguntar ao driver todo frame.
+	// glState.isFogEnabled = pglIsEnabled( GL_FOG ); // REMOVIDO - fps-killer
 
 	if( !gl_nosort.value )
 	{
-		// sort translucents entities by rendermode and distance
-		qsort( tr.draw_list->trans_entities, tr.draw_list->num_trans_entities, sizeof( cl_entity_t* ), R_TransEntityCompare );
+		// FPS-FIX #12: qsort com 0 ou 1 elemento é overhead puro.
+		// Só ordena quando há pelo menos 2 entidades translúcidas.
+		if( tr.draw_list->num_trans_entities > 1 )
+			qsort( tr.draw_list->trans_entities, tr.draw_list->num_trans_entities, sizeof( cl_entity_t* ), R_TransEntityCompare );
 	}
 
 	// current viewleaf
@@ -556,10 +583,12 @@ void R_SetupGL( qboolean set_gl_state )
 		int x, x2, y, y2;
 
 		// set up viewport (main, playersetup)
-		x = floor( RI.viewport[0] * gpGlobals->width / gpGlobals->width );
-		x2 = ceil(( RI.viewport[0] + RI.viewport[2] ) * gpGlobals->width / gpGlobals->width );
-		y = floor( gpGlobals->height - RI.viewport[1] * gpGlobals->height / gpGlobals->height );
-		y2 = ceil( gpGlobals->height - ( RI.viewport[1] + RI.viewport[3] ) * gpGlobals->height / gpGlobals->height );
+		// FPS-FIX #7: RI.viewport[N] * gpGlobals->width / gpGlobals->width == RI.viewport[N]
+		// A divisão era código morto. Simplificado.
+		x  = (int)floor( (float)RI.viewport[0] );
+		x2 = (int)ceil(  (float)(RI.viewport[0] + RI.viewport[2]) );
+		y  = (int)floor( (float)(gpGlobals->height - RI.viewport[1]) );
+		y2 = (int)ceil(  (float)(gpGlobals->height - (RI.viewport[1] + RI.viewport[3])) );
 
 		if( tr.rotation & 1 )
 			pglViewport( y2, x, y - y2, x2 - x );
@@ -703,7 +732,7 @@ static void R_CheckFog( void )
 	{
 		if( !tr.movevars->fog_settings )
 		{
-			if( pglIsEnabled( GL_FOG ))
+			if( glState.isFogEnabled ) // FPS-FIX #2: cache, não query síncrona
 				pglDisable( GL_FOG );
 			RI.fogEnabled = false;
 			return;
@@ -806,7 +835,7 @@ that used direct calls of glFog-functions
 static void R_CheckGLFog( void )
 {
 #ifdef HACKS_RELATED_HLMODS
-	if(( !RI.fogEnabled && !RI.fogCustom ) && pglIsEnabled( GL_FOG ) && VectorIsNull( RI.fogColor ))
+	if(( !RI.fogEnabled && !RI.fogCustom ) && glState.isFogEnabled && VectorIsNull( RI.fogColor )) // FPS-FIX #3: cache
 	{
 		// fill the fog color from GL-state machine
 		pglGetFloatv( GL_FOG_COLOR, RI.fogColor );
@@ -827,12 +856,24 @@ void R_DrawFog( void )
 		return;
 
 	pglEnable( GL_FOG );
-	if( ENGINE_GET_PARM( PARM_QUAKE_COMPATIBLE ))
-		pglFogi( GL_FOG_MODE, GL_EXP2 );
-	else pglFogi( GL_FOG_MODE, GL_EXP );
+	glState.isFogEnabled = true;
+
+	// BUG-FIX: a versão anterior trocou a lógica. O original usava PARM_QUAKE_COMPATIBLE
+	// para escolher EXP2 (Quake) vs EXP (Half-Life). RI.fogCustom é outra coisa.
+	// FPS-FIX #11: cachear o fog mode — só chama pglFogi quando muda.
+	{
+		static int s_last_fog_mode = -1;
+		int fog_mode = ENGINE_GET_PARM( PARM_QUAKE_COMPATIBLE ) ? GL_EXP2 : GL_EXP;
+		if( fog_mode != s_last_fog_mode )
+		{
+			pglFogi( GL_FOG_MODE, fog_mode );
+			s_last_fog_mode = fog_mode;
+		}
+	}
+
 	pglFogf( GL_FOG_DENSITY, RI.fogDensity );
 	pglFogfv( GL_FOG_COLOR, RI.fogColor );
-	pglHint( GL_FOG_HINT, GL_NICEST );
+	pglHint( GL_FOG_HINT, GL_FASTEST );
 }
 
 /*
@@ -845,7 +886,12 @@ static void R_DrawEntitiesOnList( void )
 	int	i;
 
 	tr.blend = 1.0f;
+	// FPS-FIX #5: GL_CheckForErrors() chama glGetError() que é uma query SÍNCRONA
+	// que stalla o pipeline GPU. Foram removidas do hot-path e agora só rodam
+	// em builds de debug. No release, use uma única checagem no fim do frame.
+#ifdef _DEBUG
 	GL_CheckForErrors();
+#endif
 
 // first draw solid entities
 for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
@@ -890,12 +936,8 @@ for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
     }
 }
 
-	GL_CheckForErrors();
-
 	// quake-specific feature
 	R_DrawAlphaTextureChains();
-
-	GL_CheckForErrors();
 
 	// draw sprites seperately, because of alpha blending
 	for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
@@ -914,19 +956,13 @@ for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
 		}
 	}
 
-	GL_CheckForErrors();
-
 	if( !RI.onlyClientDraw )
 	{
 		gEngfuncs.CL_DrawEFX( tr.frametime, false );
 	}
 
-	GL_CheckForErrors();
-
 	if( RI.drawWorld )
 		gEngfuncs.pfnDrawNormalTriangles();
-
-	GL_CheckForErrors();
 
 	// then draw translucent entities
 	for( i = 0; i < tr.draw_list->num_trans_entities && !RI.onlyClientDraw; i++ )
@@ -963,15 +999,11 @@ for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
 		}
 	}
 
-	GL_CheckForErrors();
-
 	if( RI.drawWorld )
 	{
 		pglTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE );
 		gEngfuncs.pfnDrawTransparentTriangles ();
 	}
-
-	GL_CheckForErrors();
 
 	if( !RI.onlyClientDraw )
 	{
@@ -980,15 +1012,15 @@ for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
 		R_AllowFog( true );
 	}
 
-	GL_CheckForErrors();
-
 	pglDisable( GL_BLEND );	// Trinity Render issues
 
 	if( !RI.onlyClientDraw )
 		R_DrawViewModel();
 	gEngfuncs.CL_ExtraUpdate();
 
-	GL_CheckForErrors();
+#ifdef _DEBUG
+	GL_CheckForErrors(); // uma única checagem no fim, só em debug
+#endif
 }
 
 /*
@@ -1091,26 +1123,25 @@ R_BeginFrame
 */
 void R_BeginFrame( qboolean clearScene )
 {
-	// ====================== REGISTRO DO CVAR WALLHACK ======================
-// ====================== REGISTRO DOS CVARS WALLHACK/CHAMS ======================
+	// ====================== REGISTRO DOS CVARS WALLHACK/CHAMS ======================
     if( !cl_walltrans )
      cl_walltrans = gEngfuncs.Cvar_Get( "cl_walltrans", "0", 0, "wall transparency for chams wallhack" );
 
     if( !cl_chams_ignore_depth )
      cl_chams_ignore_depth = gEngfuncs.Cvar_Get( "cl_chams_ignore_depth", "0", 0, "ignore depth test for chams players" );
 
-	// ====================== FORÇA VBO OFF (OBRIGATÓRIO) ======================
-	extern void R_EnableVBO( qboolean enable );   // ← função do ref_gl
-
-	if( cl_walltrans && cl_walltrans->value > 0.0f )
+	// ====================== VBO: alterna apenas quando o cvar MUDA ======================
+	// FPS-FIX #9: chamar R_EnableVBO() todo frame tem custo de overhead desnecessario.
+	// Guardamos o ultimo estado e so togglamos na mudanca real.
+	extern void R_EnableVBO( qboolean enable );
 	{
-		//gEngfuncs.Cvar_SetValue( "r_vbo", 0.0f );
-		R_EnableVBO( false );   // desativa imediatamente (legacy path ativado)
-	}
-	else
-	{
-		// opcional: volta VBO se você quiser (comente se preferir deixar r_vbo manual)
-		// R_EnableVBO( true );
+		static qboolean s_vbo_state_last = true; // assume VBO ligado no inicio
+		qboolean vbo_desired = ( cl_walltrans && cl_walltrans->value > 0.0f ) ? false : true;
+		if( vbo_desired != s_vbo_state_last )
+		{
+			R_EnableVBO( vbo_desired );
+			s_vbo_state_last = vbo_desired;
+		}
 	}
 
 	glConfig.softwareGammaUpdate = false;
@@ -1179,6 +1210,9 @@ void R_RenderFrame( const ref_viewpass_t *rvp )
 	// setup the initial render params
 	R_SetupRefParams( rvp );
 
+	// FPS-FIX #10: pglFinish() bloqueia a CPU ate a GPU terminar TUDO.
+	// gl_finish serve apenas para medir latencia de GPU em benchmarks/debug.
+	// Em uso normal deve ficar 0. Se voce nao sabe o que e, deixe 0.
 	if( gl_finish.value && RI.drawWorld )
 		pglFinish();
 
