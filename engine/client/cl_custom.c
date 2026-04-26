@@ -1,21 +1,53 @@
 /*
-cl_custom.c - downloading custom resources
-Copyright (C) 2018 Uncle Mike
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-*/
+ * cl_custom.c - downloading custom resources
+ * Copyright (C) 2018 Uncle Mike
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
 
 #include "common.h"
 #include "client.h"
 #include "net_encode.h"
+
+extern qboolean HTTP_CanDownload( void );
+
+static void CL_NormalizeDownloadPath( char *path )
+{
+	char *src, *dst;
+
+	if( !path || !*path )
+		return;
+
+	for( src = path; *src; src++ )
+	{
+		if( *src == '\\' )
+			*src = '/';
+	}
+
+	src = path;
+	dst = path;
+
+	while( *src )
+	{
+		if( *src == '/' && dst > path && dst[-1] == '/' )
+		{
+			src++;
+			continue;
+		}
+
+		*dst++ = *src++;
+	}
+
+	*dst = '\0';
+}
 
 qboolean CL_CheckFile( sizebuf_t *msg, resource_t *pResource )
 {
@@ -23,11 +55,11 @@ qboolean CL_CheckFile( sizebuf_t *msg, resource_t *pResource )
 
 	switch( pResource->type )
 	{
-	case t_sound:
-	case t_model:
-		// built-in resources not needs to be downloaded
-		if( pResource->szFileName[0] == '*' )
-			return true;
+		case t_sound:
+		case t_model:
+			// built-in resources not needs to be downloaded
+			if( pResource->szFileName[0] == '*' )
+				return true;
 		break;
 	}
 
@@ -41,6 +73,8 @@ qboolean CL_CheckFile( sizebuf_t *msg, resource_t *pResource )
 	if( pResource->type == t_sound )
 		Q_snprintf( filepath, sizeof( filepath ), DEFAULT_SOUNDPATH "%s", pResource->szFileName );
 	else Q_strncpy( filepath, pResource->szFileName, sizeof( filepath ));
+
+	CL_NormalizeDownloadPath( filepath );
 
 	if( !COM_IsSafeFileToDownload( filepath ))
 	{
@@ -72,12 +106,15 @@ qboolean CL_CheckFile( sizebuf_t *msg, resource_t *pResource )
 
 	host.downloadcount++;
 
-	if( cl.http_download )
+	if( cl.http_download && HTTP_CanDownload() )
 	{
 		HTTP_AddDownload( filepath, pResource->nDownloadSize, true, pResource );
 	}
 	else
 	{
+		if( cl.http_download )
+			Con_Reportf( S_WARN "HTTP download requested, but no valid FastDL server is available. Falling back to dlfile for %s\n", filepath );
+
 		MSG_BeginClientCmd( msg, clc_stringcmd );
 		MSG_WriteStringf( msg, "dlfile %s", filepath );
 	}
