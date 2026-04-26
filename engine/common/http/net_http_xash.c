@@ -22,6 +22,16 @@ GNU General Public License for more details.
 #include "net_ws_private.h"
 #include "miniz.h"
 
+#ifndef XASH_USE_CURL_DOWNLOADER
+#define XASH_USE_CURL_DOWNLOADER 0
+#endif
+
+#if XASH_USE_CURL_DOWNLOADER
+#include <curl/curl.h>
+#include <archive.h>
+#include <archive_entry.h>
+#endif
+
 // ====================== URL ENCODE PARA NOMES COM Ç/Ã/É (FIX PALHAÇO) ======================
 static void HTTP_UrlEncode( const char *src, char *dst, size_t dstsize )
 {
@@ -85,6 +95,7 @@ HTTP downloader
 
 typedef struct httpserver_s
 {
+	char scheme[8];
 	char host[256];
 	int port;
 	char path[MAX_SYSPATH];
@@ -101,6 +112,17 @@ typedef struct httpfile_s
 	char path[MAX_SYSPATH];
 	char url_path[MAX_SYSPATH]; // absolute redirect path, already URL-encoded when set
 	file_t *file;
+#if XASH_USE_CURL_DOWNLOADER
+	CURL *curl;
+	struct curl_slist *curl_headers;
+	qboolean curl_active;
+	qboolean curl_header_seen;
+	CURLcode curl_result;
+	long curl_http_code;
+	curl_off_t curl_dltotal;
+	curl_off_t curl_dlnow;
+	char curl_error[CURL_ERROR_SIZE];
+#endif
 	int socket;
 	int size;
 	int reported_size;
@@ -155,6 +177,14 @@ static CVAR_DEFINE_AUTO( http_max_retries, "2", FCVAR_ARCHIVE | FCVAR_PRIVILEGED
 static CVAR_DEFINE_AUTO( http_max_redirects, "5", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum HTTP redirects per file" );
 static CVAR_DEFINE_AUTO( http_show_headers, "0", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "show HTTP headers (request and response)" );
 
+#if XASH_USE_CURL_DOWNLOADER
+static CVAR_DEFINE_AUTO( http_curl, "1", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "use libcurl backend for HTTP/FastDL downloads" );
+static CVAR_DEFINE_AUTO( http_connect_timeout, "10", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "libcurl connect timeout in seconds" );
+static CVAR_DEFINE_AUTO( http_low_speed_limit, "256", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "minimum HTTP speed in bytes/sec before libcurl stall timeout" );
+static CVAR_DEFINE_AUTO( http_low_speed_time, "20", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "seconds below http_low_speed_limit before libcurl timeout" );
+static CVAR_DEFINE_AUTO( http_max_active_requests, "6", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum active libcurl downloads" );
+#endif
+
 static int HTTP_FileFree( httpfile_t *file );
 static void HTTP_FreeFile( httpfile_t *file, qboolean error );
 static int HTTP_FileConnect( httpfile_t *file );
@@ -168,6 +198,14 @@ static qboolean HTTP_ReopenIncomplete( httpfile_t *file, qboolean truncate );
 static qboolean HTTP_RestartTransfer( httpfile_t *file );
 static qboolean HTTP_ParseURLParts( const char *url_, char *host, size_t hostsize, int *port, char *path, size_t pathsize );
 static void HTTP_BuildRequestURI( httpfile_t *file, char *dst, size_t dstsize );
+#if XASH_USE_CURL_DOWNLOADER
+static int HTTP_FileCurlActive( httpfile_t *file );
+static qboolean HTTP_CurlStartFile( httpfile_t *file );
+static void HTTP_CurlCleanupFile( httpfile_t *file );
+static void HTTP_CurlPump( void );
+static void HTTP_CurlGlobalShutdown( void );
+static qboolean HTTP_ArchiveExtractMember( const char *archive_path, const char *member_name, const char *out_path );
+#endif
 
 static void HTTP_CloseSocketOnly( httpfile_t *file )
 {
@@ -195,6 +233,13 @@ static void HTTP_ResetResponseState( httpfile_t *file )
 	file->bytes_sent = 0;
 	file->blocktime = 0;
 	file->blockreason = "queued";
+#if XASH_USE_CURL_DOWNLOADER
+	file->curl_header_seen = false;
+	file->curl_http_code = 0;
+	file->curl_dltotal = 0;
+	file->curl_dlnow = 0;
+	file->curl_error[0] = '\0';
+#endif
 	memset( file->buf, 0, sizeof( file->buf ));
 }
 
@@ -322,8 +367,12 @@ static qboolean HTTP_ParseURLParts( const char *url_, char *host, size_t hostsiz
 		url = url_ + 7;
 	else if( !Q_strnicmp( url_, "https://", 8 ))
 	{
+#if XASH_USE_CURL_DOWNLOADER
+		url = url_ + 8;
+#else
 		Con_Printf( S_ERROR "HTTP: HTTPS FastDL URL '%s' needs a libcurl/OpenSSL backend; falling back to legacy download.\n", url_ );
 		return false;
+#endif
 	}
 	else return false;
 
@@ -344,7 +393,12 @@ static qboolean HTTP_ParseURLParts( const char *url_, char *host, size_t hostsiz
 		while( *url && *url != '/' && *url != '\r' && *url != '\n' )
 			url++;
 	}
-	else *port = 80;
+	else
+	{
+		if( !Q_strnicmp( url_, "https://", 8 ))
+			*port = 443;
+		else *port = 80;
+	}
 
 	if( *port <= 0 || *port > 65535 )
 		return false;
@@ -397,6 +451,483 @@ static void HTTP_BuildRequestURI( httpfile_t *file, char *dst, size_t dstsize )
 	}
 }
 
+#if XASH_USE_CURL_DOWNLOADER
+
+static CURLM *http_curl_multi;
+static int http_curl_running;
+
+/*
+=============
+HTTP_FileCurlActive
+
+A curl-backed transfer is progressed by HTTP_CurlPump from HTTP_Run.
+This per-file state only contributes progress to scr_download.
+=============
+*/
+static int HTTP_FileCurlActive( httpfile_t *file )
+{
+	if( file && file->size > 0 )
+	{
+		http.progress += (float)file->downloaded / file->size;
+		http.progress_count++;
+	}
+
+	return 0;
+}
+
+static void HTTP_CurlGlobalInit( void )
+{
+	if( !http_curl_multi )
+	{
+		curl_global_init( CURL_GLOBAL_DEFAULT );
+		http_curl_multi = curl_multi_init();
+	}
+}
+
+static void HTTP_CurlCleanupFile( httpfile_t *file )
+{
+	if( !file )
+		return;
+
+	if( file->curl && http_curl_multi )
+		curl_multi_remove_handle( http_curl_multi, file->curl );
+
+	if( file->curl )
+	{
+		curl_easy_cleanup( file->curl );
+		file->curl = NULL;
+	}
+
+	if( file->curl_headers )
+	{
+		curl_slist_free_all( file->curl_headers );
+		file->curl_headers = NULL;
+	}
+
+	if( file->curl_active )
+	{
+		if( http.active_count > 0 )
+			http.active_count--;
+		file->curl_active = false;
+	}
+}
+
+static void HTTP_CurlGlobalShutdown( void )
+{
+	if( http_curl_multi )
+	{
+		curl_multi_cleanup( http_curl_multi );
+		http_curl_multi = NULL;
+	}
+
+	curl_global_cleanup();
+}
+
+static const char *HTTP_ServerScheme( const httpserver_t *server )
+{
+	if( server && server->scheme[0] )
+		return server->scheme;
+
+	return "http";
+}
+
+static void HTTP_CurlBuildURL( httpfile_t *file, char *dst, size_t dstsize )
+{
+	char encoded_path[MAX_SYSPATH * 2];
+	const char *path;
+	const char *scheme = HTTP_ServerScheme( file->server );
+
+	if( file->url_path[0] )
+	{
+		Q_snprintf( dst, dstsize, "%s://%s:%d%s", scheme, file->server->host, file->server->port, file->url_path );
+		return;
+	}
+
+	HTTP_UrlEncode( file->path, encoded_path, sizeof( encoded_path ));
+
+	path = encoded_path;
+	while( *path == '/' )
+		path++;
+
+	Q_snprintf( dst, dstsize, "%s://%s:%d%s%s", scheme, file->server->host, file->server->port, file->server->path, path );
+}
+
+static void HTTP_CurlCloseDownloadFile( httpfile_t *file )
+{
+	if( file && file->file )
+	{
+		FS_Close( file->file );
+		file->file = NULL;
+	}
+}
+
+static size_t HTTP_CurlWrite( char *ptr, size_t size, size_t nmemb, void *userdata )
+{
+	httpfile_t *file = (httpfile_t *)userdata;
+	size_t total = size * nmemb;
+	int written;
+
+	if( !file || !file->file || total <= 0 )
+		return 0;
+
+	written = FS_Write( file->file, ptr, total );
+	if( written != (int)total )
+		return 0;
+
+	file->downloaded += written;
+	file->lastchecksize += written;
+	file->blocktime = 0;
+
+	return total;
+}
+
+static size_t HTTP_CurlHeader( char *ptr, size_t size, size_t nmemb, void *userdata )
+{
+	httpfile_t *file = (httpfile_t *)userdata;
+	size_t total = size * nmemb;
+	char line[128];
+	size_t copylen;
+
+	if( !file || total < 5 )
+		return total;
+
+	copylen = Q_min( total, sizeof( line ) - 1 );
+	memcpy( line, ptr, copylen );
+	line[copylen] = '\0';
+
+	if( !Q_strncmp( line, "HTTP/", 5 ) )
+	{
+		const char *space = Q_strchr( line, ' ' );
+		long code = space ? Q_atoi( space + 1 ) : 0;
+
+		file->curl_http_code = code;
+		file->curl_header_seen = true;
+
+		/*
+		 * Integrity guard for resume:
+		 * if a server ignores Range and sends 200 OK, truncate before
+		 * the body callback appends anything to the old partial.
+		 */
+		if( code == 200 && file->resume_from > 0 )
+		{
+			Con_Reportf( S_WARN "HTTP/CURL: server ignored Range for %s, restarting from zero\n", file->path );
+			HTTP_ReopenIncomplete( file, true );
+		}
+	}
+
+	return total;
+}
+
+static int HTTP_CurlProgress( void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow )
+{
+	httpfile_t *file = (httpfile_t *)clientp;
+
+	(void)ultotal;
+	(void)ulnow;
+
+	if( !file )
+		return 0;
+
+	file->curl_dltotal = dltotal;
+	file->curl_dlnow = dlnow;
+
+	if( dltotal > 0 )
+		file->size = file->resume_from + (int)dltotal;
+
+	file->blocktime = 0;
+	return 0;
+}
+
+static qboolean HTTP_CurlStartFile( httpfile_t *file )
+{
+	char url[MAX_SYSPATH * 4];
+	string useragent;
+	fs_offset_t existing_size = 0;
+	char incname[MAX_SYSPATH];
+
+	if( !file || !file->server )
+		return false;
+
+	if( http.active_count >= (int)http_max_active_requests.value )
+		return false;
+
+	HTTP_CurlGlobalInit();
+
+	if( !http_curl_multi )
+		return false;
+
+	HTTP_MakeIncompleteName( file, incname, sizeof( incname ));
+
+	if( FS_FileExists( incname, true ) )
+		existing_size = FS_FileSize( incname, true );
+
+	if( existing_size < 0 )
+		existing_size = 0;
+
+	file->downloaded = (int)existing_size;
+	file->resume_from = file->downloaded;
+
+	if( !HTTP_ReopenIncomplete( file, false ))
+		return false;
+
+	if( COM_StringEmpty( http_useragent.string ) || !Q_strcmp( http_useragent.string, "xash3d" ))
+	{
+		Q_snprintf( useragent, sizeof( useragent ), "%s/%s (%s-%s; build %d; %s)",
+			XASH_ENGINE_NAME, XASH_VERSION, Q_buildos( ), Q_buildarch( ), Q_buildnum( ), g_buildcommit );
+	}
+	else Q_strncpy( useragent, http_useragent.string, sizeof( useragent ));
+
+	HTTP_CurlBuildURL( file, url, sizeof( url ) );
+
+	file->curl = curl_easy_init();
+	if( !file->curl )
+	{
+		HTTP_CurlCloseDownloadFile( file );
+		return false;
+	}
+
+	file->curl_error[0] = '\0';
+	file->curl_result = CURLE_OK;
+	file->curl_http_code = 0;
+	file->curl_dltotal = 0;
+	file->curl_dlnow = 0;
+	file->curl_header_seen = false;
+
+	curl_easy_setopt( file->curl, CURLOPT_URL, url );
+	curl_easy_setopt( file->curl, CURLOPT_PRIVATE, file );
+	curl_easy_setopt( file->curl, CURLOPT_USERAGENT, useragent );
+
+	curl_easy_setopt( file->curl, CURLOPT_WRITEFUNCTION, HTTP_CurlWrite );
+	curl_easy_setopt( file->curl, CURLOPT_WRITEDATA, file );
+	curl_easy_setopt( file->curl, CURLOPT_HEADERFUNCTION, HTTP_CurlHeader );
+	curl_easy_setopt( file->curl, CURLOPT_HEADERDATA, file );
+
+	curl_easy_setopt( file->curl, CURLOPT_NOPROGRESS, 0L );
+	curl_easy_setopt( file->curl, CURLOPT_XFERINFOFUNCTION, HTTP_CurlProgress );
+	curl_easy_setopt( file->curl, CURLOPT_XFERINFODATA, file );
+
+	curl_easy_setopt( file->curl, CURLOPT_ERRORBUFFER, file->curl_error );
+	curl_easy_setopt( file->curl, CURLOPT_FOLLOWLOCATION, 1L );
+	curl_easy_setopt( file->curl, CURLOPT_MAXREDIRS, (long)http_max_redirects.value );
+	curl_easy_setopt( file->curl, CURLOPT_CONNECTTIMEOUT, (long)http_connect_timeout.value );
+	curl_easy_setopt( file->curl, CURLOPT_LOW_SPEED_LIMIT, (long)http_low_speed_limit.value );
+	curl_easy_setopt( file->curl, CURLOPT_LOW_SPEED_TIME, (long)http_low_speed_time.value );
+	curl_easy_setopt( file->curl, CURLOPT_FAILONERROR, 0L );
+	curl_easy_setopt( file->curl, CURLOPT_NOSIGNAL, 1L );
+
+	/*
+	 * FastDL resume is safer with identity encoding. It avoids resuming
+	 * inside a gzip/deflate content-encoded stream.
+	 */
+	curl_easy_setopt( file->curl, CURLOPT_ACCEPT_ENCODING, "identity" );
+
+#if LIBCURL_VERSION_NUM >= 0x071900
+	curl_easy_setopt( file->curl, CURLOPT_TCP_KEEPALIVE, 1L );
+#endif
+
+	if( file->resume_from > 0 )
+		curl_easy_setopt( file->curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)file->resume_from );
+
+	if( curl_multi_add_handle( http_curl_multi, file->curl ) != CURLM_OK )
+	{
+		curl_easy_cleanup( file->curl );
+		file->curl = NULL;
+		HTTP_CurlCloseDownloadFile( file );
+		return false;
+	}
+
+	file->curl_active = true;
+	file->pfn_process = HTTP_FileCurlActive;
+	file->blocktime = 0;
+	file->blockreason = "libcurl transfer";
+	http.active_count++;
+
+	Con_Reportf( "HTTP/CURL: started %s\n", url );
+	return true;
+}
+
+static void HTTP_CurlFinishFile( httpfile_t *file, qboolean error )
+{
+	if( !file )
+		return;
+
+	/*
+	 * If a complete local partial caused 416, accept it only when the
+	 * resource table supplied a matching expected size.
+	 */
+	if( file->curl_http_code == 416 )
+	{
+		if( file->resume_from > 0 && file->reported_size > 0 && file->resume_from == file->reported_size )
+		{
+			Con_Reportf( "HTTP/CURL: %s already complete according to local partial size\n", file->path );
+			error = false;
+		}
+		else error = true;
+	}
+
+	HTTP_CurlCleanupFile( file );
+	HTTP_FreeFile( file, error );
+}
+
+static void HTTP_CurlPump( void )
+{
+	CURLMsg *msg;
+	int msgs_left;
+	CURLMcode mc;
+
+	if( !http_curl_multi )
+		return;
+
+	mc = curl_multi_perform( http_curl_multi, &http_curl_running );
+	if( mc != CURLM_OK )
+	{
+		Con_Printf( S_ERROR "HTTP/CURL: curl_multi_perform failed: %s\n", curl_multi_strerror( mc ));
+		return;
+	}
+
+	while(( msg = curl_multi_info_read( http_curl_multi, &msgs_left ) ))
+	{
+		if( msg->msg == CURLMSG_DONE )
+		{
+			char *private_data = NULL;
+			httpfile_t *file = NULL;
+			long code = 0;
+			qboolean error = false;
+
+			curl_easy_getinfo( msg->easy_handle, CURLINFO_PRIVATE, &private_data );
+			curl_easy_getinfo( msg->easy_handle, CURLINFO_RESPONSE_CODE, &code );
+
+			file = (httpfile_t *)private_data;
+			if( !file )
+				continue;
+
+			file->curl_result = msg->data.result;
+			file->curl_http_code = code;
+
+			if( msg->data.result != CURLE_OK )
+			{
+				Con_Printf( S_ERROR "HTTP/CURL: failed %s: %s\n",
+					file->path,
+					file->curl_error[0] ? file->curl_error : curl_easy_strerror( msg->data.result ));
+				error = true;
+			}
+			else if( code < 200 || code >= 300 )
+			{
+				Con_Printf( S_ERROR "HTTP/CURL: bad HTTP code %ld for %s\n", code, file->path );
+				if( code == 400 || code == 401 || code == 403 || code == 404 )
+					file->no_retry = true;
+				error = true;
+			}
+
+			HTTP_CurlFinishFile( file, error );
+		}
+	}
+}
+
+/*
+========================
+HTTP_ArchiveExtractMember
+
+Small libarchive helper used by the experimental manifest path.
+It is intentionally path-safe and streams data instead of loading the
+whole archive into memory.
+========================
+*/
+static qboolean HTTP_ArchiveExtractMember( const char *archive_path, const char *member_name, const char *out_path )
+{
+	struct archive *a;
+	struct archive_entry *entry;
+	file_t *out = NULL;
+	int r;
+
+	if( !archive_path || !member_name || !out_path )
+		return false;
+
+	if( Q_strstr( member_name, ".." ) || member_name[0] == '/' || member_name[0] == '\\' )
+	{
+		Con_Printf( S_ERROR "HTTP/archive: unsafe member path %s\n", member_name );
+		return false;
+	}
+
+	a = archive_read_new();
+	if( !a )
+		return false;
+
+	archive_read_support_format_zip( a );
+	archive_read_support_format_tar( a );
+	archive_read_support_filter_gzip( a );
+
+	if( archive_read_open_filename( a, archive_path, 65536 ) != ARCHIVE_OK )
+	{
+		Con_Printf( S_ERROR "HTTP/archive: cannot open %s: %s\n", archive_path, archive_error_string( a ));
+		archive_read_free( a );
+		return false;
+	}
+
+	while(( r = archive_read_next_header( a, &entry )) == ARCHIVE_OK )
+	{
+		const char *name = archive_entry_pathname( entry );
+
+		if( name && !Q_strcmp( name, member_name ))
+		{
+			const void *buff;
+			size_t size;
+			la_int64_t offset;
+
+			out = FS_Open( out_path, "wb", true );
+			if( !out )
+			{
+				archive_read_free( a );
+				return false;
+			}
+
+			while(( r = archive_read_data_block( a, &buff, &size, &offset )) == ARCHIVE_OK )
+			{
+				(void)offset;
+
+				if( FS_Write( out, buff, size ) != (int)size )
+				{
+					FS_Close( out );
+					archive_read_free( a );
+					return false;
+				}
+			}
+
+			FS_Close( out );
+			archive_read_free( a );
+			return true;
+		}
+
+		archive_read_data_skip( a );
+	}
+
+	archive_read_free( a );
+	return false;
+}
+
+/*
+=======================
+HTTP_ExtractArchive_f
+
+Manual debug command:
+http_extractarchive <archive-on-disk> <member> <out-path>
+=======================
+*/
+static void HTTP_ExtractArchive_f( void )
+{
+	if( Cmd_Argc() != 4 )
+	{
+		Con_Printf( S_USAGE "http_extractarchive <archive-on-disk> <member> <out-path>\n" );
+		return;
+	}
+
+	if( HTTP_ArchiveExtractMember( Cmd_Argv( 1 ), Cmd_Argv( 2 ), Cmd_Argv( 3 )))
+		Con_Printf( "HTTP/archive: extracted %s from %s to %s\n", Cmd_Argv( 2 ), Cmd_Argv( 1 ), Cmd_Argv( 3 ));
+	else Con_Printf( S_ERROR "HTTP/archive: failed to extract %s from %s\n", Cmd_Argv( 2 ), Cmd_Argv( 1 ));
+}
+
+#endif
+
 static qboolean HTTP_ApplyRedirect( httpfile_t *file, const char *location )
 {
 	char host[256];
@@ -419,6 +950,9 @@ static qboolean HTTP_ApplyRedirect( httpfile_t *file, const char *location )
 			return false;
 
 		memset( &file->redirect_server, 0, sizeof( file->redirect_server ));
+		if( !Q_strnicmp( location, "https://", 8 ))
+			Q_strncpy( file->redirect_server.scheme, "https", sizeof( file->redirect_server.scheme ));
+		else Q_strncpy( file->redirect_server.scheme, "http", sizeof( file->redirect_server.scheme ));
 		Q_strncpy( file->redirect_server.host, host, sizeof( file->redirect_server.host ));
 		Q_strncpy( file->redirect_server.path, "/", sizeof( file->redirect_server.path ));
 		file->redirect_server.port = port;
@@ -492,6 +1026,9 @@ static void HTTP_FreeFile( httpfile_t *file, qboolean error )
 	qboolean was_open = false;
 
 	file->blocktime = 0;
+#if XASH_USE_CURL_DOWNLOADER
+	HTTP_CurlCleanupFile( file );
+#endif
 
 	if( file->file )
 	{
@@ -572,6 +1109,22 @@ static int HTTP_FileQueue( httpfile_t *file )
 		HTTP_FreeFile( file, true );
 		return 0;
 	}
+
+#if XASH_USE_CURL_DOWNLOADER
+	if( http_curl.value )
+	{
+		HTTP_NormalizePath( file->path );
+		HTTP_NormalizePath( file->server->path );
+
+		if( http.active_count >= (int)http_max_active_requests.value )
+			return 0;
+
+		if( HTTP_CurlStartFile( file ))
+			return 0;
+
+		Con_Reportf( S_WARN "HTTP/CURL: failed to start %s, using legacy HTTP backend\n", file->path );
+	}
+#endif
 
 	HTTP_NormalizePath( file->path );
 	HTTP_NormalizePath( file->server->path );
@@ -1317,6 +1870,11 @@ void HTTP_Run( void )
 {
 	httpfile_t *curfile;
 
+#if XASH_USE_CURL_DOWNLOADER
+	if( http_curl.value )
+		HTTP_CurlPump();
+#endif
+
 	http.resolving = false;
 	http.progress_count = 0;
 	http.progress = 0;
@@ -1435,6 +1993,9 @@ static httpserver_t *HTTP_ParseURL( const char *url_ )
 		return NULL;
 
 	server = Z_Calloc( sizeof( httpserver_t ));
+	if( !Q_strnicmp( url_, "https://", 8 ))
+		Q_strncpy( server->scheme, "https", sizeof( server->scheme ));
+	else Q_strncpy( server->scheme, "http", sizeof( server->scheme ));
 	Q_strncpy( server->host, parsed_host, sizeof( server->host ));
 	Q_strncpy( server->path, path, sizeof( server->path ));
 	server->port = port;
@@ -1508,6 +2069,10 @@ static void HTTP_Clear_f( void )
 		httpfile_t *file = http.first_file;
 
 		http.first_file = http.first_file->next;
+
+#if XASH_USE_CURL_DOWNLOADER
+		HTTP_CurlCleanupFile( file );
+#endif
 
 		if( file->file )
 			FS_Close( file->file );
@@ -1583,7 +2148,7 @@ static void HTTP_List_f( void )
 				HTTP_BuildRequestURI( file, uri, sizeof( uri ));
 				file->server = oldserver;
 
-				Con_Printf( "\thttp://%s:%d%s\n", server->host, server->port, uri );
+				Con_Printf( "\t%s://%s:%d%s\n", server->scheme[0] ? server->scheme : "http", server->host, server->port, uri );
 			}
 		}
 	}
@@ -1627,6 +2192,14 @@ void HTTP_Init( void )
 	Cvar_RegisterVariable( &http_max_retries );
 	Cvar_RegisterVariable( &http_max_redirects );
 	Cvar_RegisterVariable( &http_show_headers );
+#if XASH_USE_CURL_DOWNLOADER
+	Cvar_RegisterVariable( &http_curl );
+	Cvar_RegisterVariable( &http_connect_timeout );
+	Cvar_RegisterVariable( &http_low_speed_limit );
+	Cvar_RegisterVariable( &http_low_speed_time );
+	Cvar_RegisterVariable( &http_max_active_requests );
+	Cmd_AddRestrictedCommand( "http_extractarchive", HTTP_ExtractArchive_f, "extract archive member using libarchive" );
+#endif
 }
 
 /*
@@ -1637,6 +2210,9 @@ HTTP_Shutdown
 void HTTP_Shutdown( void )
 {
 	HTTP_Clear_f();
+#if XASH_USE_CURL_DOWNLOADER
+	HTTP_CurlGlobalShutdown();
+#endif
 
 	while( http.first_server )
 	{

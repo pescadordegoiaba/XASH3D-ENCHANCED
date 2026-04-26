@@ -18,6 +18,7 @@
 #include "net_encode.h"
 
 extern qboolean HTTP_CanDownload( void );
+extern void HTTP_AddDownload( const char *path, int size, qboolean process, resource_t *res );
 
 static void CL_NormalizeDownloadPath( char *path )
 {
