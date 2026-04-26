@@ -28,6 +28,21 @@ ref_instance_t	RI;
 cvar_t *cl_walltrans = NULL;
 cvar_t *cl_chams_ignore_depth = NULL;
 
+/*
+================
+aspect_ratio
+
+Manual 3D horizontal projection stretch.
+1.0 = engine/default aspect
+0.1..0.9 = stretched/wider-looking 3D image
+>1.0 = opposite direction/squeezed horizontally
+
+This intentionally affects only the 3D projection/frustum. HUD/menu/2D
+remain controlled by the existing 2D path.
+================
+*/
+static cvar_t *r_manual_aspect_ratio = NULL;
+
 static int R_RankForRenderMode( int rendermode )
 {
 	switch( rendermode )
@@ -355,6 +370,78 @@ static float R_GetFarClip( void )
 
 /*
 ===============
+R_GetManualAspectRatio
+
+Console command / CVAR:
+	aspect_ratio 1.0	// normal
+	aspect_ratio 0.5	// stretched
+	aspect_ratio 0.1	// extreme stretched
+===============
+*/
+static float R_GetManualAspectRatio( void )
+{
+	float value;
+
+	if( !r_manual_aspect_ratio )
+	{
+		r_manual_aspect_ratio = gEngfuncs.Cvar_Get( "aspect_ratio", "1.0", FCVAR_GLCONFIG,
+			"manual 3D horizontal aspect stretch: 1=normal, 0.1=extreme stretch, >1=squeeze" );
+	}
+
+	if( !r_manual_aspect_ratio )
+		return 1.0f;
+
+	value = r_manual_aspect_ratio->value;
+
+	if( value < 0.1f )
+		value = 0.1f;
+	else if( value > 10.0f )
+		value = 10.0f;
+
+	return value;
+}
+
+/*
+===============
+R_StretchHorizontalFov
+
+Scales only RI.fov_x, leaving fov_y intact. This gives the classic
+"stretched" look without changing real resolution or viewport.
+===============
+*/
+static float R_StretchHorizontalFov( float fov_x, float aspect_ratio )
+{
+	if( aspect_ratio == 1.0f )
+		return fov_x;
+
+	if( fov_x <= 1.0f || fov_x >= 179.0f )
+		return fov_x;
+
+	return atan( tan( DEG2RAD( fov_x ) * 0.5f ) * aspect_ratio ) * 2.0f / ( M_PI_F / 180.0f );
+}
+
+/*
+===============
+R_ApplyManualAspectRatio
+
+Applied after water FOV wobble and before frustum/projection setup.
+===============
+*/
+static void R_ApplyManualAspectRatio( void )
+{
+	float aspect_ratio;
+
+	if( RI.drawOrtho || !RP_NORMALPASS() )
+		return;
+
+	aspect_ratio = R_GetManualAspectRatio();
+
+	if( aspect_ratio != 1.0f )
+		RI.fov_x = R_StretchHorizontalFov( RI.fov_x, aspect_ratio );
+}
+
+/*
+===============
 R_SetupFrustum
 ===============
 */
@@ -367,6 +454,9 @@ void R_SetupFrustum( void )
 		RI.fov_x = atan( tan( DEG2RAD( RI.fov_x ) / 2 ) * ( 0.97f + sin( gp_cl->time * 1.5f ) * 0.03f )) * 2 / (M_PI_F / 180.0f);
 		RI.fov_y = atan( tan( DEG2RAD( RI.fov_y ) / 2 ) * ( 1.03f - sin( gp_cl->time * 1.5f ) * 0.03f )) * 2 / (M_PI_F / 180.0f);
 	}
+
+	// Manual 3D aspect/stretch CVAR. Does not require vid_restart.
+	R_ApplyManualAspectRatio();
 
 	// build the transformation matrix for the given view angles
 	AngleVectors( RI.viewangles, RI.vforward, RI.vright, RI.vup );
