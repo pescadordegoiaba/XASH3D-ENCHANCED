@@ -42,21 +42,52 @@ static struct
 	qboolean addr_initialized;
 } broker;
 
+static qboolean SteamBroker_Enabled( void )
+{
+	return steam_login.value != 0.0f || Q_stricmp( cl_ticket_generator.string, "steam" ) == 0;
+}
+
 static qboolean SteamBroker_UpdateBrokerAddress( void )
 {
-	if( NET_NetadrType( &broker.adr ) == NA_UNDEFINED )
-	{
-		if( !NET_StringToAdr( cl_steam_broker_addr.string, &broker.adr ))
-			return false;
-	}
+	netadr_t parsed = { 0 };
+
+	if( !NET_StringToAdr( cl_steam_broker_addr.string, &parsed ))
+		return false;
+
+	broker.adr = parsed;
 	return true;
 }
 
 qboolean SteamBroker_InitiateGameConnection( netadr_t serveradr, int challenge )
 {
+	if( FBitSet( cl_steam_broker_addr.flags, FCVAR_CHANGED ))
+	{
+		NET_NetadrSetType( &broker.adr, NA_UNDEFINED );
+		broker.addr_initialized = false;
+		ClearBits( cl_steam_broker_addr.flags, FCVAR_CHANGED );
+	}
+
+	if( !SteamBroker_UpdateBrokerAddress() )
+	{
+		Con_Printf( S_ERROR "steam_login: endereço do SteamBroker inválido: %s\n", cl_steam_broker_addr.string );
+		return false;
+	}
+	broker.addr_initialized = true;
+
 	// only ipv4 supported
 	if( NET_NetadrType( &serveradr ) != NA_IP )
 		return false;
+
+	if( !SteamBroker_Enabled() )
+		return false;
+
+	if( !SteamBroker_UpdateBrokerAddress() )
+	{
+		Con_Printf( "steam_login 1: endereco invalido em cl_steam_broker_addr: %s\n", cl_steam_broker_addr.string );
+		return false;
+	}
+
+	Con_Printf( "steam_login 1: pedindo ticket ao SteamBroker em %s para %s...\n", cl_steam_broker_addr.string, NET_AdrToString( serveradr ) );
 
 	broker.challenge = challenge;
 	broker.serveradr = serveradr;
@@ -76,7 +107,7 @@ void SteamBroker_TerminateGameConnection( void )
 	if( NET_NetadrType( &cls.serveradr ) != NA_IP )
 		return;
 
-	if( Q_stricmp( cl_ticket_generator.string, "steam" ) != 0 )
+	if( !SteamBroker_Enabled() )
 		return;
 
 	// sb_disconnect <ip:port> <challenge>
@@ -88,7 +119,7 @@ void SteamBroker_TerminateGameConnection( void )
 
 void SteamBroker_AnnounceGameStart( const char *gamedir )
 {
-	if( Q_stricmp( cl_ticket_generator.string, "steam" ) != 0 )
+	if( !SteamBroker_Enabled() )
 		return;
 
 	NET_Config( true, true ); // initialize sockets to be able to send packets to broker
@@ -106,10 +137,10 @@ void SteamBroker_AnnounceGameShutdown( netadr_t broker_addr )
 
 void SteamBroker_Frame( void )
 {
-	if( Q_stricmp( cl_ticket_generator.string, "steam" ) != 0 )
+	if( !SteamBroker_Enabled() )
 		return;
 
-	qboolean restart = FBitSet( cl_steam_broker_addr.flags|cl_ticket_generator.flags, FCVAR_CHANGED );
+	qboolean restart = FBitSet( cl_steam_broker_addr.flags|cl_ticket_generator.flags|steam_login.flags, FCVAR_CHANGED );
 
 	if( !broker.addr_initialized )
 	{
@@ -126,8 +157,12 @@ void SteamBroker_Frame( void )
 
 	if( restart )
 	{
+		/* steam_broker_patch: force reparse address */
+		NET_NetadrSetType( &broker.adr, NA_UNDEFINED );
+		broker.addr_initialized = false;
 		broker.announced = false;
 		ClearBits( cl_ticket_generator.flags, FCVAR_CHANGED );
+		ClearBits( steam_login.flags, FCVAR_CHANGED );
 		ClearBits( cl_steam_broker_addr.flags, FCVAR_CHANGED );
 	}
 
@@ -170,8 +205,12 @@ void SteamBroker_HandlePacket( netadr_t from, sizebuf_t *msg )
 	MSG_ReadBytes( msg, cls.steamid, sizeof( cls.steamid ));
 
 	len = MSG_ReadDword( msg );
-	if( len > sizeof( ticket )) // TODO: print error, proceed without ticket?
+	if( len > sizeof( ticket ))
+	{
+		Con_Printf( S_ERROR "steam_login: ticket do SteamBroker excedeu o limite interno: %u bytes.\n", (unsigned)len );
+		cls.broker_wait = false;
 		return;
+	}
 
 	MSG_ReadBytes( msg, ticket, len );
 
@@ -192,7 +231,7 @@ void SteamBroker_Init( void )
 
 void SteamBroker_Shutdown( void )
 {
-	if( Q_stricmp( cl_ticket_generator.string, "steam" ) != 0 )
+	if( !SteamBroker_Enabled() )
 		return;
 
 	SteamBroker_AnnounceGameShutdown( broker.adr );

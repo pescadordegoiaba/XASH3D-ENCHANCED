@@ -95,6 +95,7 @@ static CVAR_DEFINE_AUTO( bottomcolor, "0", FCVAR_USERINFO|FCVAR_ARCHIVE|FCVAR_FI
 CVAR_DEFINE_AUTO( rate, "25000", FCVAR_USERINFO|FCVAR_ARCHIVE|FCVAR_FILTERABLE, "player network rate" );
 
 CVAR_DEFINE_AUTO( cl_ticket_generator, "revemu2013", FCVAR_ARCHIVE, "you wouldn't steal a car" );
+CVAR_DEFINE_AUTO( steam_login, "0", 0, "0 = conexao padrao/non-Steam; 1 = usar SteamBroker para servidores Steam" );
 static CVAR_DEFINE_AUTO( cl_advertise_engine_in_name, "1", FCVAR_ARCHIVE|FCVAR_PRIVILEGED, "add [Xash3D] to the nickname when connecting to GoldSrc servers" );
 static CVAR_DEFINE_AUTO( cl_log_outofband, "0", FCVAR_ARCHIVE, "log out of band messages, can be useful for server admins and for engine debugging" );
 static CVAR_DEFINE_AUTO( cl_autorecord, "0", 0, "automatically start recording a demo after joining the server" );
@@ -1158,7 +1159,7 @@ static void CL_SendConnectPacket( connprotocol_t proto, int challenge )
 	{
 		// if the cl_ticket_generator is set to "steam" we need to get ticket
 		// from steam broker, which is asynchronous process by nature
-		if( !Q_stricmp( cl_ticket_generator.string, "steam" ))
+		if( steam_login.value != 0.0f || !Q_stricmp( cl_ticket_generator.string, "steam" ))
 		{
 			if( SteamBroker_InitiateGameConnection( adr, challenge ))
 			{
@@ -1349,6 +1350,17 @@ static void CL_CheckForResend( void )
 		else
 			CL_SendBandwidthTest( adr, false );
 	}
+	else if( cls.broker_wait )
+	{
+		if( Platform_DoubleTime() - cls.timestart > 5.0 )
+		{
+			Con_Printf( "steam_login 1: SteamBroker nao respondeu em 5 segundos. Mantenha cl_steam_broker_addr em 127.0.0.1:27420 e execute o broker Steam. Use steam_login 0 para conexao padrao.\n" );
+			cls.broker_wait = false;
+			CL_Disconnect();
+			return;
+		}
+	}
+
 	else if( !cls.broker_wait )
 	{
 		Con_Printf( "Connecting to %s... (retry #%i)\n", cls.servername, cls.connect_retry );
@@ -3384,6 +3396,7 @@ static void CL_InitLocal( void )
 	cl.resourcesonhand.pNext = cl.resourcesonhand.pPrev = &cl.resourcesonhand;
 
 	Cvar_RegisterVariable( &cl_ticket_generator );
+	Cvar_RegisterVariable( &steam_login );
 	Cvar_RegisterVariable( &cl_advertise_engine_in_name );
 	Cvar_RegisterVariable( &cl_log_outofband );
 	Cvar_RegisterVariable( &cl_autorecord );

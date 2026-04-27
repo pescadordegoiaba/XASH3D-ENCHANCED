@@ -724,6 +724,7 @@ extern convar_t	v_dark;	// start from dark
 extern convar_t	net_graph;
 extern convar_t	rate;
 extern convar_t cl_ticket_generator;
+extern convar_t steam_login;
 extern convar_t	m_ignore;
 extern convar_t	r_showtree;
 extern convar_t	ui_renderworld;
@@ -787,6 +788,7 @@ void CL_SignonReply( connprotocol_t proto );
 void CL_ClearState( void );
 void CL_SetCheatState( qboolean multiplayer, qboolean allow_cheats );
 void CL_SendGoldSrcConnectPacket( netadr_t adr, int challenge, const void *ticket, size_t ticketlen );
+
 
 //
 // cl_demo.c
