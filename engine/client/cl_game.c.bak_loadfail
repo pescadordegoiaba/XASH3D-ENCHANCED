@@ -2690,12 +2690,12 @@ CL_LoadModel
 =============
 */
 
-
 /*
 ====================
-SkinModel local client viewmodel registry - robust patch
+SkinModel local client viewmodel registry
 
-Carrega viewmodels locais em models/mod/* sem depender do precache do servidor.
+Permite que o client DLL carregue viewmodels locais em models/mod/*
+sem depender do precache do servidor. Restrito para evitar path traversal.
 ====================
 */
 #ifndef SKINMODEL_LOCAL_MAX
@@ -2744,41 +2744,27 @@ static int CL_SkinModel_FindLocalIndex( const char *path )
 	return 0;
 }
 
-static model_t *CL_SkinModel_LoadLocalModel( const char *path, int *index )
+static int CL_SkinModel_RegisterLocalModel( const char *path )
 {
 	int i;
 	model_t *mod;
 
 	if( !CL_SkinModel_IsAllowedLocalPath( path ))
-		return NULL;
+		return 0;
 
 	i = CL_SkinModel_FindLocalIndex( path );
 	if( i > 0 )
-	{
-		if( index )
-			*index = i;
-
-		return cl.models[i];
-	}
+		return i;
 
 	if( cl_numSkinLocalModels >= SKINMODEL_LOCAL_MAX )
-	{
-		Con_Printf( "[skin_model:engine] limite de modelos locais atingido: %i\n", SKINMODEL_LOCAL_MAX );
-		return NULL;
-	}
+		return 0;
 
 	if( cl.nummodels + 1 >= MAX_MODELS )
-	{
-		Con_Printf( "[skin_model:engine] MAX_MODELS atingido, nao posso registrar: %s\n", path );
-		return NULL;
-	}
+		return 0;
 
 	mod = Mod_ForName( path, false, false );
 	if( !mod )
-	{
-		Con_Printf( "[skin_model:engine] Mod_ForName falhou: %s\n", path );
-		return NULL;
-	}
+		return 0;
 
 	i = cl.nummodels++;
 	cl.models[i] = mod;
@@ -2788,18 +2774,14 @@ static model_t *CL_SkinModel_LoadLocalModel( const char *path, int *index )
 	cl_skinLocalModels[cl_numSkinLocalModels].index = i;
 	cl_numSkinLocalModels++;
 
-	if( index )
-		*index = i;
-
-	Con_Printf( "[skin_model:engine] carregado %s como index %i\n", path, i );
-	return mod;
+	Con_DPrintf( "SkinModel: registered local model %s as index %i\n", path, i );
+	return i;
 }
 
 
 model_t *CL_LoadModel( const char *modelname, int *index )
 {
 	int i;
-	model_t *local;
 
 	if( index )
 		*index = -1;
@@ -2812,9 +2794,15 @@ model_t *CL_LoadModel( const char *modelname, int *index )
 		return CL_ModelHandle( i );
 	}
 
-	local = CL_SkinModel_LoadLocalModel( modelname, index );
-	if( local )
-		return local;
+	// Fallback local para viewmodels de skin: models/mod/<arma>/<skin>/v_<arma>.mdl
+	i = CL_SkinModel_RegisterLocalModel( modelname );
+	if( i > 0 )
+	{
+		if( index )
+			*index = i;
+
+		return CL_ModelHandle( i );
+	}
 
 	return NULL;
 }

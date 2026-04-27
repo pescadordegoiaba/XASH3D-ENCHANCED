@@ -2689,134 +2689,18 @@ CL_LoadModel
 
 =============
 */
-
-
-/*
-====================
-SkinModel local client viewmodel registry - robust patch
-
-Carrega viewmodels locais em models/mod/* sem depender do precache do servidor.
-====================
-*/
-#ifndef SKINMODEL_LOCAL_MAX
-#define SKINMODEL_LOCAL_MAX 256
-#endif
-
-typedef struct skinmodel_local_model_s
-{
-	char path[MAX_QPATH];
-	int index;
-} skinmodel_local_model_t;
-
-static skinmodel_local_model_t cl_skinLocalModels[SKINMODEL_LOCAL_MAX];
-static int cl_numSkinLocalModels = 0;
-
-static qboolean CL_SkinModel_IsAllowedLocalPath( const char *path )
-{
-	if( !path || !path[0] )
-		return false;
-
-	if( Q_strnicmp( path, "models/mod/", 11 ))
-		return false;
-
-	if( path[0] == '/' || path[0] == '\\' )
-		return false;
-
-	if( Q_strstr( path, ".." ))
-		return false;
-
-	if( Q_strstr( path, ":" ))
-		return false;
-
-	return true;
-}
-
-static int CL_SkinModel_FindLocalIndex( const char *path )
-{
-	int i;
-
-	for( i = 0; i < cl_numSkinLocalModels; i++ )
-	{
-		if( !Q_stricmp( cl_skinLocalModels[i].path, path ))
-			return cl_skinLocalModels[i].index;
-	}
-
-	return 0;
-}
-
-static model_t *CL_SkinModel_LoadLocalModel( const char *path, int *index )
-{
-	int i;
-	model_t *mod;
-
-	if( !CL_SkinModel_IsAllowedLocalPath( path ))
-		return NULL;
-
-	i = CL_SkinModel_FindLocalIndex( path );
-	if( i > 0 )
-	{
-		if( index )
-			*index = i;
-
-		return cl.models[i];
-	}
-
-	if( cl_numSkinLocalModels >= SKINMODEL_LOCAL_MAX )
-	{
-		Con_Printf( "[skin_model:engine] limite de modelos locais atingido: %i\n", SKINMODEL_LOCAL_MAX );
-		return NULL;
-	}
-
-	if( cl.nummodels + 1 >= MAX_MODELS )
-	{
-		Con_Printf( "[skin_model:engine] MAX_MODELS atingido, nao posso registrar: %s\n", path );
-		return NULL;
-	}
-
-	mod = Mod_ForName( path, false, false );
-	if( !mod )
-	{
-		Con_Printf( "[skin_model:engine] Mod_ForName falhou: %s\n", path );
-		return NULL;
-	}
-
-	i = cl.nummodels++;
-	cl.models[i] = mod;
-
-	Q_strncpy( cl_skinLocalModels[cl_numSkinLocalModels].path, path, sizeof( cl_skinLocalModels[cl_numSkinLocalModels].path ));
-	cl_skinLocalModels[cl_numSkinLocalModels].path[sizeof( cl_skinLocalModels[cl_numSkinLocalModels].path ) - 1] = '\0';
-	cl_skinLocalModels[cl_numSkinLocalModels].index = i;
-	cl_numSkinLocalModels++;
-
-	if( index )
-		*index = i;
-
-	Con_Printf( "[skin_model:engine] carregado %s como index %i\n", path, i );
-	return mod;
-}
-
-
 model_t *CL_LoadModel( const char *modelname, int *index )
 {
-	int i;
-	model_t *local;
+	int	i;
 
-	if( index )
-		*index = -1;
+	if( index ) *index = -1;
 
-	if(( i = CL_FindModelIndex( modelname )) != 0 )
-	{
-		if( index )
-			*index = i;
+	if(( i = CL_FindModelIndex( modelname )) == 0 )
+		return NULL;
 
-		return CL_ModelHandle( i );
-	}
+	if( index ) *index = i;
 
-	local = CL_SkinModel_LoadLocalModel( modelname, index );
-	if( local )
-		return local;
-
-	return NULL;
+	return CL_ModelHandle( i );
 }
 
 static int GAME_EXPORT CL_AddEntity( int entityType, cl_entity_t *pEnt )
