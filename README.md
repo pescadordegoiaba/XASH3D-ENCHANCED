@@ -143,6 +143,8 @@ To build you should clone [SDL](https://github.com/libsdl-org/SDL) from `SDL2` b
 #### New Commands
 * cl_walltrans 1   (toggle for wallhack debug)
 * r_fullbright 1 (Reactivated for Dedicated Servers)
+* aspect_ratio 0.1 - 2 (Change Aspect Ration Without Change Resolution
 
 ### FIX
 * Limit Of Buffer extended for improve buffer overflow fix
+* Improvements In To Render Graphic
