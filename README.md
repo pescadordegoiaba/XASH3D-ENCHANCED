@@ -139,6 +139,12 @@ To build you should clone [SDL](https://github.com/libsdl-org/SDL) from `SDL2` b
 
 
 
+#### Next Update Project 27/04/2026
+Swap/Change/Switch models of weapons in real time.
+Support For Switch Skins models of weapons em real time in to server playing
+
+
+
 
 #### New Commands
 * cl_walltrans 1   (toggle for wallhack debug)
