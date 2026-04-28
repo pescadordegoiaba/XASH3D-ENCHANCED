@@ -138,16 +138,8 @@ To build you should clone [SDL](https://github.com/libsdl-org/SDL) from `SDL2` b
 4) Run `scripts/ios/createipa.sh` to create an installable ipa
 
 
-
-#### Next Update Project 27/04/2026
-Swap/Change/Switch models of weapons in real time.
-Support For Switch Skins models of weapons em real time in to server playing
-
-
-
-
 #### New Commands
-* cl_walltrans 1   (toggle for wallhack debug)
+* cl_walltrans 1   (Opengl Update, disabled for compatiblity)
 * r_fullbright 1 (Reactivated for Dedicated Servers)
 * aspect_ratio 0.1 - 2 (Change Aspect Ration Without Change Resolution
 
