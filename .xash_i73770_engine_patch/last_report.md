@@ -1,0 +1,92 @@
+# XASH i7-3770 Engine Patch Report
+
+Root: `/home/gullin/claude/XASH3D-ENCHANCED`
+
+Backup: `/home/gullin/claude/XASH3D-ENCHANCED/.xash_i73770_engine_patch/backups/20260501_141513`
+
+
+## Alterados/criados
+
+- `engine/common/xash_i73770_opt.h`
+- `engine/common/xash_i73770_opt.c`
+- `engine/common/host.c`
+- `engine/common/common.c`
+- `engine/common/world.c`
+- `engine/common/zone.c`
+- `engine/common/net_buffer.c`
+- `engine/common/net_chan.c`
+- `engine/common/net_encode.c`
+- `engine/common/net_ws.c`
+- `engine/common/model.c`
+- `engine/common/mod_alias.c`
+- `engine/common/mod_bmodel.c`
+- `engine/common/mod_sprite.c`
+- `engine/common/mod_studio.c`
+- `engine/common/pm_trace.c`
+- `engine/common/imagelib/img_utils.c`
+- `engine/common/imagelib/img_main.c`
+- `engine/common/imagelib/img_png.c`
+- `engine/common/imagelib/img_tga.c`
+- `engine/common/imagelib/img_bmp.c`
+- `engine/common/imagelib/img_wad.c`
+- `engine/client/cl_main.c`
+- `engine/client/cl_frame.c`
+- `engine/client/cl_parse.c`
+- `engine/client/cl_render.c`
+- `engine/client/cl_view.c`
+- `engine/client/cl_tent.c`
+- `engine/client/cl_efrag.c`
+- `engine/client/cl_pmove.c`
+- `engine/client/ref_common.c`
+- `engine/client/vid_common.c`
+- `engine/client/s_mix.c`
+- `engine/client/s_main.c`
+- `engine/server/sv_main.c`
+- `engine/server/sv_phys.c`
+- `engine/server/sv_move.c`
+- `engine/server/sv_world.c`
+- `engine/server/sv_frame.c`
+- `engine/server/sv_game.c`
+- `engine/server/sv_pmove.c`
+- `engine/server/sv_client.c`
+- `engine/platform/linux/sys_linux.c`
+- `engine/platform/posix/sys_posix.c`
+- `engine/platform/sdl2/vid_sdl2.c`
+- `engine/platform/sdl2/sys_sdl2.c`
+- `ref/gl/gl_rmain.c`
+- `ref/gl/gl_draw.c`
+- `ref/gl/gl_backend.c`
+- `ref/gl/gl_rmisc.c`
+- `ref/gl/gl_rmath.c`
+- `ref/gl/gl_cull.c`
+- `ref/gl/gl_studio.c`
+- `ref/gl/gl_rsurf.c`
+- `filesystem/filesystem.c`
+- `filesystem/dir.c`
+- `filesystem/pak.c`
+- `filesystem/wad.c`
+- `filesystem/zip.c`
+- `build_xash_32_curl_archive.sh`
+- `Documentation/I73770_ENGINE_PATCH.md`
+
+## Removidos
+
+- nenhum
+
+## Ignorados
+
+- nenhum
+
+## Avisos
+
+- nenhum
+
+## Falhas
+
+- nenhuma
+
+## Próximo comando
+
+```bash
+./build_xash_32_curl_archive.sh
+```

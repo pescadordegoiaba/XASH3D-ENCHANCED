@@ -1,3 +1,10 @@
+/* XASH_I73770_ENGINE_PATCH_BEGIN */
+#if defined(XASH_I73770_ENGINE_PATCH) && (defined(__i386__) || defined(__x86_64__)) && defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize ("O3,omit-frame-pointer")
+#pragma GCC target ("sse4.1,sse4.2,avx")
+#endif
+/* XASH_I73770_ENGINE_PATCH_END */
+
 /*
 pak.c - PAK support for filesystem
 Copyright (C) 2003-2006 Mathieu Olivier

@@ -49,12 +49,12 @@ static qboolean SteamBroker_Enabled( void )
 
 static qboolean SteamBroker_UpdateBrokerAddress( void )
 {
-	netadr_t parsed = { 0 };
+	netadr_t adr;
 
-	if( !NET_StringToAdr( cl_steam_broker_addr.string, &parsed ))
+	if( !NET_StringToAdr( cl_steam_broker_addr.string, &adr ))
 		return false;
 
-	broker.adr = parsed;
+	broker.adr = adr;
 	return true;
 }
 
@@ -124,6 +124,12 @@ void SteamBroker_AnnounceGameStart( const char *gamedir )
 
 	NET_Config( true, true ); // initialize sockets to be able to send packets to broker
 
+	if( !SteamBroker_UpdateBrokerAddress() )
+	{
+		Con_Printf( S_ERROR "%s: endereco do SteamBroker invalido: %s\n", __func__, cl_steam_broker_addr.string );
+		return;
+	}
+
 	char buf[512];
 	int len = Q_snprintf( buf, sizeof( buf ), "sb_gamedir %s", gamedir );
 
@@ -132,6 +138,10 @@ void SteamBroker_AnnounceGameStart( const char *gamedir )
 
 void SteamBroker_AnnounceGameShutdown( netadr_t broker_addr )
 {
+	/* goldsrc_steam_legacy: ignore undefined broker shutdown */
+	if( NET_NetadrType( &broker_addr ) == NA_UNDEFINED )
+		return;
+
 	NET_SendPacket( NS_CLIENT, sizeof( "sb_terminate" ) - 1, "sb_terminate", broker_addr );
 }
 
@@ -199,8 +209,12 @@ void SteamBroker_HandlePacket( netadr_t from, sizebuf_t *msg )
 
 	challenge = MSG_ReadLong( msg );
 
-	if( broker.challenge != challenge ) // TODO: print error
+	if( broker.challenge != challenge )
+	{
+		Con_Printf( S_ERROR "steam_login: SteamBroker respondeu challenge incorreto.\n" );
+		cls.broker_wait = false;
 		return;
+	}
 
 	MSG_ReadBytes( msg, cls.steamid, sizeof( cls.steamid ));
 

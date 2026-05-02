@@ -1,27 +1,11 @@
 /*
- * steam_broker.cpp - SteamBroker externo para Xash3D.
+ * steam_broker.cpp - SteamBroker externo para Xash3D/GoldSrc.
  *
- * Este programa fica fora da engine GPL e usa o Steamworks SDK oficial.
+ * Este broker usa a API legacy ISteamUser::InitiateGameConnection
+ * quando disponível. Isso gera um auth blob de jogo/servidor, não apenas
+ * um GetAuthSessionTicket moderno genérico.
  *
- * Protocolo esperado pelo engine/client/cl_steam.c:
- *
- * Xash -> broker, UDP cru:
- *   sb_connect <ip:port> <serverSteamID64> <true|false> <challenge>
- *   sb_disconnect <ip:port> <challenge>
- *   sb_gamedir <gamedir>
- *   sb_terminate
- *
- * Broker -> Xash, pacote connectionless/OOB:
- *   0xFF 0xFF 0xFF 0xFF "sb_connect\n"
- *   int32_le challenge
- *   uint64_le steamid64
- *   uint32_le ticket_len
- *   ticket bytes
- *
- * Segurança/legal:
- *   - não falsifica SteamID;
- *   - não implementa bypass de DRM/VAC/anti-cheat;
- *   - só chama SteamAPI_Init + ISteamUser::GetAuthSessionTicket.
+ * Não burla Steam/VAC/DRM. Exige Steam aberto, conta logada e licença do AppID.
  */
 
 #include <arpa/inet.h>
@@ -45,14 +29,15 @@
 
 static volatile sig_atomic_t g_running = 1;
 
-struct TicketEntry
+struct ConnEntry
 {
-    HAuthTicket handle = k_HAuthTicketInvalid;
-    uint32_t challenge = 0;
     std::string server;
+    uint32_t challenge = 0;
+    uint32_t ip_host = 0;
+    uint16_t port_host = 0;
 };
 
-static std::map<std::string, TicketEntry> g_tickets;
+static std::map<std::string, ConnEntry> g_conns;
 
 static void on_signal(int)
 {
@@ -78,139 +63,170 @@ static std::string key_for(const std::string& server, uint32_t challenge)
     return server + "#" + std::to_string(challenge);
 }
 
-static bool parse_listen(const char* s, std::string& ip, uint16_t& port)
+static bool parse_host_port(const char* s, std::string& ip, uint16_t& port)
 {
     const char* colon = strrchr(s, ':');
     if (!colon || colon == s)
         return false;
+
     ip.assign(s, colon - s);
     long p = strtol(colon + 1, nullptr, 10);
     if (p <= 0 || p > 65535)
         return false;
+
     port = (uint16_t)p;
     return true;
 }
 
-static bool split_addr(const std::string& server, std::string& ip, uint16_t& port)
+static bool parse_server_ipv4(const std::string& server, uint32_t& ip_host, uint16_t& port_host)
 {
-    size_t colon = server.rfind(':');
-    if (colon == std::string::npos || colon == 0)
+    std::string ip;
+    uint16_t port = 0;
+    if (!parse_host_port(server.c_str(), ip, port))
         return false;
-    ip = server.substr(0, colon);
-    long p = strtol(server.c_str() + colon + 1, nullptr, 10);
-    if (p <= 0 || p > 65535)
+
+    in_addr addr{};
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1)
         return false;
-    port = (uint16_t)p;
+
+    ip_host = ntohl(addr.s_addr); // Steamworks quer host order.
+    port_host = port;
     return true;
 }
 
-static void cancel_all_tickets()
+static void terminate_one(const ConnEntry& e)
 {
-    for (auto& kv : g_tickets)
+    if (SteamUser())
     {
-        if (kv.second.handle != k_HAuthTicketInvalid)
-            SteamUser()->CancelAuthTicket(kv.second.handle);
+#ifdef STEAM_BROKER_DEPRECATED_SUFFIX
+        SteamUser()->TerminateGameConnection_DEPRECATED(e.ip_host, e.port_host);
+#else
+        SteamUser()->TerminateGameConnection(e.ip_host, e.port_host);
+#endif
     }
-    g_tickets.clear();
+    printf("[broker] TerminateGameConnection: %s challenge=%u\n",
+           e.server.c_str(), e.challenge);
 }
 
-static void cancel_ticket_for(const std::string& server, uint32_t challenge)
+static void terminate_key(const std::string& server, uint32_t challenge)
 {
-    auto it = g_tickets.find(key_for(server, challenge));
-    if (it != g_tickets.end())
+    auto it = g_conns.find(key_for(server, challenge));
+    if (it != g_conns.end())
     {
-        if (it->second.handle != k_HAuthTicketInvalid)
-            SteamUser()->CancelAuthTicket(it->second.handle);
-        printf("[broker] ticket cancelado para %s challenge=%u\n", server.c_str(), challenge);
-        g_tickets.erase(it);
+        terminate_one(it->second);
+        g_conns.erase(it);
     }
 }
 
-static bool send_ticket_response(int sock, const sockaddr_in& to, const std::string& server, uint64_t serverSteamId, bool secure, uint32_t challenge)
+static void terminate_all()
+{
+    for (const auto& kv : g_conns)
+        terminate_one(kv.second);
+    g_conns.clear();
+}
+
+static bool send_auth_blob_response(
+    int sock,
+    const sockaddr_in& to,
+    const std::string& server,
+    uint64_t serverSteamID,
+    bool secure,
+    uint32_t challenge)
 {
     if (!SteamUser() || !SteamUser()->BLoggedOn())
     {
-        fprintf(stderr, "[broker] SteamUser indisponível ou usuário não logado.\n");
+        fprintf(stderr, "[broker] SteamUser indisponivel ou usuario nao logado.\n");
         return false;
     }
 
-    uint8_t ticket[4096];
-    uint32 ticket_len = 0;
+    uint32_t ip_host = 0;
+    uint16_t port_host = 0;
+    if (!parse_server_ipv4(server, ip_host, port_host))
+    {
+        fprintf(stderr, "[broker] servidor invalido ou nao-IPv4: %s\n", server.c_str());
+        return false;
+    }
 
-    /*
-     * API moderna:
-     * HAuthTicket GetAuthSessionTicket(void *pTicket, int cbMaxTicket, uint32 *pcbTicket,
-     *                                 const SteamNetworkingIdentity *pIdentityRemote);
-     *
-     * Para servidores GoldSrc existentes, o Xash já envia serverSteamId quando conhece.
-     * Mesmo assim, alguns servidores antigos não expõem identidade confiável antes do handshake.
-     * Por isso, usamos nullptr por padrão para manter compatibilidade.
-     *
-     * Se quiser experimentar identidade remota, compile com:
-     *   make REMOTE_IDENTITY=1
-     */
-#ifdef STEAM_BROKER_REMOTE_IDENTITY
-    SteamNetworkingIdentity remote;
-    memset(&remote, 0, sizeof(remote));
-    if (serverSteamId != 0)
-    {
-        remote.SetSteamID(CSteamID((uint64)serverSteamId));
-    }
-    else
-    {
-        std::string ip;
-        uint16_t port = 0;
-        if (split_addr(server, ip, port))
-        {
-            SteamNetworkingIPAddr addr;
-            addr.Clear();
-            addr.SetIPv4(inet_addr(ip.c_str()), port);
-            remote.SetIPAddr(addr);
-        }
-    }
-    HAuthTicket h = SteamUser()->GetAuthSessionTicket(ticket, sizeof(ticket), &ticket_len, &remote);
+    uint8_t auth_blob[2048];
+    memset(auth_blob, 0, sizeof(auth_blob));
+
+    CSteamID gameServerID((uint64)serverSteamID);
+
+    int blob_len = 0;
+#ifdef STEAM_BROKER_DEPRECATED_SUFFIX
+    blob_len = SteamUser()->InitiateGameConnection_DEPRECATED(
+        auth_blob,
+        sizeof(auth_blob),
+        gameServerID,
+        ip_host,
+        port_host,
+        secure
+    );
 #else
-    HAuthTicket h = SteamUser()->GetAuthSessionTicket(ticket, sizeof(ticket), &ticket_len, nullptr);
+    blob_len = SteamUser()->InitiateGameConnection(
+        auth_blob,
+        sizeof(auth_blob),
+        gameServerID,
+        ip_host,
+        port_host,
+        secure
+    );
 #endif
 
-    if (h == k_HAuthTicketInvalid || ticket_len == 0 || ticket_len > sizeof(ticket))
+    if (blob_len <= 0 || blob_len > (int)sizeof(auth_blob))
     {
-        fprintf(stderr, "[broker] GetAuthSessionTicket falhou. handle=%u len=%u\n", (unsigned)h, (unsigned)ticket_len);
+        fprintf(stderr,
+                "[broker] InitiateGameConnection falhou. server=%s serverSteamID=%llu secure=%s ip_host=0x%08x port=%u len=%d\n",
+                server.c_str(),
+                (unsigned long long)serverSteamID,
+                secure ? "true" : "false",
+                ip_host,
+                (unsigned)port_host,
+                blob_len);
         return false;
     }
 
-    TicketEntry e;
-    e.handle = h;
-    e.challenge = challenge;
+    ConnEntry e;
     e.server = server;
-    g_tickets[key_for(server, challenge)] = e;
+    e.challenge = challenge;
+    e.ip_host = ip_host;
+    e.port_host = port_host;
+    g_conns[key_for(server, challenge)] = e;
 
-    uint64_t steamid64 = SteamUser()->GetSteamID().ConvertToUint64();
+    const uint64_t steamid64 = SteamUser()->GetSteamID().ConvertToUint64();
 
     std::vector<uint8_t> out;
-    out.reserve(4 + 11 + 4 + 8 + 4 + ticket_len);
+    out.reserve(4 + 11 + 4 + 8 + 4 + blob_len);
+
     put_u32_le(out, 0xFFFFFFFFu);
     const char marker[] = "sb_connect\n";
     out.insert(out.end(), marker, marker + sizeof(marker) - 1);
     put_u32_le(out, challenge);
     put_u64_le(out, steamid64);
-    put_u32_le(out, ticket_len);
-    out.insert(out.end(), ticket, ticket + ticket_len);
+    put_u32_le(out, (uint32_t)blob_len);
+    out.insert(out.end(), auth_blob, auth_blob + blob_len);
 
-    ssize_t sent = sendto(sock, out.data(), out.size(), 0, (const sockaddr*)&to, sizeof(to));
+    ssize_t sent = sendto(sock, out.data(), out.size(), 0,
+                          (const sockaddr*)&to, sizeof(to));
     if (sent < 0)
     {
         perror("[broker] sendto");
-        SteamUser()->CancelAuthTicket(h);
-        g_tickets.erase(key_for(server, challenge));
+        terminate_key(server, challenge);
         return false;
     }
 
-    char toip[64];
+    char toip[64] = {0};
     inet_ntop(AF_INET, &to.sin_addr, toip, sizeof(toip));
-    printf("[broker] ticket enviado: xash=%s:%u server=%s serverSteamID=%llu secure=%s challenge=%u steamID64=%llu ticket=%u bytes\n",
-           toip, ntohs(to.sin_port), server.c_str(), (unsigned long long)serverSteamId,
-           secure ? "true" : "false", challenge, (unsigned long long)steamid64, (unsigned)ticket_len);
+
+    printf("[broker] legacy auth blob enviado: xash=%s:%u server=%s serverSteamID=%llu secure=%s challenge=%u steamID64=%llu blob=%d bytes\n",
+           toip,
+           ntohs(to.sin_port),
+           server.c_str(),
+           (unsigned long long)serverSteamID,
+           secure ? "true" : "false",
+           challenge,
+           (unsigned long long)steamid64,
+           blob_len);
     return true;
 }
 
@@ -222,18 +238,23 @@ static void handle_packet(int sock, const char* buf, ssize_t len, const sockaddr
     {
         char server[128] = {0};
         char secure_s[16] = {0};
-        unsigned long long serverSteamId = 0;
+        unsigned long long serverSteamID = 0;
         unsigned int challenge = 0;
 
-        int n = sscanf(msg.c_str(), "sb_connect %127s %llu %15s %u", server, &serverSteamId, secure_s, &challenge);
+        int n = sscanf(msg.c_str(), "sb_connect %127s %llu %15s %u",
+                       server, &serverSteamID, secure_s, &challenge);
         if (n != 4)
         {
-            fprintf(stderr, "[broker] pacote sb_connect inválido: %s\n", msg.c_str());
+            fprintf(stderr, "[broker] sb_connect invalido: %s\n", msg.c_str());
             return;
         }
 
-        bool secure = (strcmp(secure_s, "true") == 0 || strcmp(secure_s, "1") == 0);
-        send_ticket_response(sock, from, server, (uint64_t)serverSteamId, secure, challenge);
+        const bool secure =
+            strcmp(secure_s, "true") == 0 ||
+            strcmp(secure_s, "1") == 0 ||
+            strcmp(secure_s, "secure") == 0;
+
+        send_auth_blob_response(sock, from, server, (uint64_t)serverSteamID, secure, challenge);
         return;
     }
 
@@ -241,8 +262,11 @@ static void handle_packet(int sock, const char* buf, ssize_t len, const sockaddr
     {
         char server[128] = {0};
         unsigned int challenge = 0;
-        if (sscanf(msg.c_str(), "sb_disconnect %127s %u", server, &challenge) == 2)
-            cancel_ticket_for(server, challenge);
+        int n = sscanf(msg.c_str(), "sb_disconnect %127s %u", server, &challenge);
+        if (n == 2)
+            terminate_key(server, challenge);
+        else
+            fprintf(stderr, "[broker] sb_disconnect invalido: %s\n", msg.c_str());
         return;
     }
 
@@ -259,101 +283,33 @@ static void handle_packet(int sock, const char* buf, ssize_t len, const sockaddr
         return;
     }
 
-    fprintf(stderr, "[broker] pacote desconhecido: %.*s\n", (int)len, buf);
+    fprintf(stderr, "[broker] pacote desconhecido: %s\n", msg.c_str());
 }
 
-static void usage(const char* argv0)
+static int run_server(const char* listen_addr)
 {
-    printf("Uso:\n");
-    printf("  %s --listen 127.0.0.1:27420 [--appid 10]\n", argv0);
-    printf("\n");
-    printf("Notas:\n");
-    printf("  --appid cria/atualiza steam_appid.txt no diretório atual antes do SteamAPI_Init.\n");
-    printf("  Para Counter-Strike 1.6, o AppID comum é 10. Use apenas com jogo legítimo na sua conta.\n");
-}
-
-int main(int argc, char** argv)
-{
-    std::string listen_ip = "127.0.0.1";
-    uint16_t listen_port = 27420;
-    const char* appid = nullptr;
-
-    for (int i = 1; i < argc; ++i)
+    std::string ip;
+    uint16_t port = 0;
+    if (!parse_host_port(listen_addr, ip, port))
     {
-        if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc)
-        {
-            if (!parse_listen(argv[++i], listen_ip, listen_port))
-            {
-                fprintf(stderr, "Endereço inválido para --listen.\n");
-                return 2;
-            }
-        }
-        else if (strcmp(argv[i], "--appid") == 0 && i + 1 < argc)
-        {
-            appid = argv[++i];
-        }
-        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
-        {
-            usage(argv[0]);
-            return 0;
-        }
-        else
-        {
-            usage(argv[0]);
-            return 2;
-        }
+        fprintf(stderr, "[broker] --listen invalido: %s\n", listen_addr);
+        return 2;
     }
-
-    if (appid && *appid)
-    {
-        FILE* f = fopen("steam_appid.txt", "wb");
-        if (!f)
-        {
-            perror("steam_appid.txt");
-            return 2;
-        }
-        fprintf(f, "%s\n", appid);
-        fclose(f);
-        printf("[broker] steam_appid.txt escrito com AppID %s\n", appid);
-    }
-
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-
-    if (!SteamAPI_Init())
-    {
-        fprintf(stderr, "[broker] SteamAPI_Init falhou.\n");
-        fprintf(stderr, "         Abra o Steam, faça login, confira steam_appid.txt e libsteam_api.so.\n");
-        return 1;
-    }
-
-    if (!SteamUser() || !SteamUser()->BLoggedOn())
-    {
-        fprintf(stderr, "[broker] SteamAPI iniciou, mas usuário não está logado.\n");
-        SteamAPI_Shutdown();
-        return 1;
-    }
-
-    printf("[broker] Steam logado. SteamID64=%llu\n",
-           (unsigned long long)SteamUser()->GetSteamID().ConvertToUint64());
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0)
     {
         perror("socket");
-        SteamAPI_Shutdown();
-        return 1;
+        return 2;
     }
 
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(listen_port);
-    if (inet_pton(AF_INET, listen_ip.c_str(), &addr.sin_addr) != 1)
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1)
     {
-        fprintf(stderr, "IP inválido: %s\n", listen_ip.c_str());
+        fprintf(stderr, "[broker] IP invalido: %s\n", ip.c_str());
         close(sock);
-        SteamAPI_Shutdown();
         return 2;
     }
 
@@ -361,13 +317,11 @@ int main(int argc, char** argv)
     {
         perror("bind");
         close(sock);
-        SteamAPI_Shutdown();
-        return 1;
+        return 2;
     }
 
-    printf("[broker] ouvindo UDP em %s:%u\n", listen_ip.c_str(), (unsigned)listen_port);
-    printf("[broker] agora abra o Xash e use: cl_steam_broker_addr %s:%u; steam_login 1; connect IP:PORT\n",
-           listen_ip.c_str(), (unsigned)listen_port);
+    printf("[broker] ouvindo UDP em %s\n", listen_addr);
+    printf("[broker] usando Steam legacy auth: InitiateGameConnection + TerminateGameConnection\n");
 
     while (g_running)
     {
@@ -377,9 +331,9 @@ int main(int argc, char** argv)
         FD_ZERO(&rfds);
         FD_SET(sock, &rfds);
 
-        timeval tv;
+        timeval tv{};
         tv.tv_sec = 0;
-        tv.tv_usec = 16000;
+        tv.tv_usec = 100000;
 
         int r = select(sock + 1, &rfds, nullptr, nullptr, &tv);
         if (r < 0)
@@ -390,20 +344,63 @@ int main(int argc, char** argv)
             break;
         }
 
-        if (r > 0 && FD_ISSET(sock, &rfds))
+        if (r == 0)
+            continue;
+
+        sockaddr_in from{};
+        socklen_t fromlen = sizeof(from);
+        char buf[4096];
+        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0,
+                             (sockaddr*)&from, &fromlen);
+        if (n > 0)
+            handle_packet(sock, buf, n, from);
+    }
+
+    terminate_all();
+    close(sock);
+    return 0;
+}
+
+int main(int argc, char** argv)
+{
+    const char* listen = "127.0.0.1:27420";
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc)
         {
-            char buf[2048];
-            sockaddr_in from;
-            socklen_t fromlen = sizeof(from);
-            ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromlen);
-            if (n > 0)
-                handle_packet(sock, buf, n, from);
+            listen = argv[++i];
+        }
+        else
+        {
+            fprintf(stderr, "uso: %s [--listen 127.0.0.1:27420]\n", argv[0]);
+            return 2;
         }
     }
 
-    printf("[broker] encerrando, cancelando tickets...\n");
-    cancel_all_tickets();
-    close(sock);
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    if (!SteamAPI_Init())
+    {
+        fprintf(stderr, "[broker] SteamAPI_Init falhou.\n");
+        fprintf(stderr, "         Confira Steam aberto/logado, steam_appid.txt=10, licença do CS 1.6 e libsteam_api.so 32-bit.\n");
+        return 1;
+    }
+
+    if (!SteamUser() || !SteamUser()->BLoggedOn())
+    {
+        fprintf(stderr, "[broker] Steam iniciou, mas usuário não está logado.\n");
+        SteamAPI_Shutdown();
+        return 1;
+    }
+
+    printf("[broker] Steam logado. SteamID64=%llu\n",
+           (unsigned long long)SteamUser()->GetSteamID().ConvertToUint64());
+
+    int rc = run_server(listen);
+
+    printf("[broker] encerrando.\n");
     SteamAPI_Shutdown();
-    return 0;
+    return rc;
 }

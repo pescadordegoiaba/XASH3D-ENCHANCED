@@ -361,3 +361,8 @@ cmake-build-*
 3rdparty/SDL
 3rdparty/hlsdk-portable
 !scripts/build-ninja.py
+
+# XASH_I73770_PATCH
+build/pgo-i73770/
+build/i73770/
+.xash_i73770_patch/
