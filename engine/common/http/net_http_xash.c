@@ -172,7 +172,7 @@ static struct http_static_s
 static CVAR_DEFINE_AUTO( http_useragent, "", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "User-Agent string" );
 static CVAR_DEFINE_AUTO( http_autoremove, "1", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "remove broken files" );
 static CVAR_DEFINE_AUTO( http_timeout, "45", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "stall timeout for http downloader" );
-static CVAR_DEFINE_AUTO( http_maxconnections, "6", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum simultaneous HTTP downloads" );
+static CVAR_DEFINE_AUTO( http_maxconnections, "12", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum simultaneous HTTP downloads" );
 static CVAR_DEFINE_AUTO( http_max_retries, "2", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "retries per HTTP server before fallback/next server" );
 static CVAR_DEFINE_AUTO( http_max_redirects, "5", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum HTTP redirects per file" );
 static CVAR_DEFINE_AUTO( http_show_headers, "0", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "show HTTP headers (request and response)" );
@@ -182,7 +182,7 @@ static CVAR_DEFINE_AUTO( http_curl, "1", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "use 
 static CVAR_DEFINE_AUTO( http_connect_timeout, "10", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "libcurl connect timeout in seconds" );
 static CVAR_DEFINE_AUTO( http_low_speed_limit, "256", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "minimum HTTP speed in bytes/sec before libcurl stall timeout" );
 static CVAR_DEFINE_AUTO( http_low_speed_time, "20", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "seconds below http_low_speed_limit before libcurl timeout" );
-static CVAR_DEFINE_AUTO( http_max_active_requests, "6", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum active libcurl downloads" );
+static CVAR_DEFINE_AUTO( http_max_active_requests, "12", FCVAR_ARCHIVE | FCVAR_PRIVILEGED, "maximum active libcurl downloads" );
 #endif
 
 static int HTTP_FileFree( httpfile_t *file );

@@ -553,7 +553,8 @@ void CL_ParseGoldSrcServerMessage( sizebuf_t *msg )
 	{
 		if( MSG_CheckOverflow( msg ))
 		{
-			Host_Error( "%s: overflow!\n", __func__ );
+			Con_Printf( S_ERROR "%s: dropping malformed packet: overflow at %d/%d bytes\n",
+				__func__, MSG_GetNumBytesRead( msg ), MSG_GetMaxBytes( msg ));
 			return;
 		}
 

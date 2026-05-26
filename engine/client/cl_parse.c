@@ -475,7 +475,10 @@ void CL_BatchResourceRequest( qboolean initialize )
 				break;
 			}
 			if( !CL_CheckFile( &msg, p ))
+			{
+				done_downloading = false;
 				break;
+			}
 			CL_MoveToOnHandList( p );
 			break;
 		case t_world:
@@ -2275,6 +2278,14 @@ CL_ParseUserMessage
 handles all user messages
 ==============
 */
+static void CL_DropBadUserMessagePacket( sizebuf_t *msg, int svc_num, const char *reason )
+{
+	Con_Printf( S_ERROR "%s: dropping malformed user message %d: %s at %d/%d bytes\n",
+		__func__, svc_num, reason, MSG_GetNumBytesRead( msg ), MSG_GetMaxBytes( msg ));
+
+	MSG_SeekToBit( msg, 0, SEEK_END );
+}
+
 void CL_ParseUserMessage( sizebuf_t *msg, int svc_num, connprotocol_t proto )
 {
 	byte	pbuf[MAX_USERMSG_LENGTH];
@@ -2283,8 +2294,7 @@ void CL_ParseUserMessage( sizebuf_t *msg, int svc_num, connprotocol_t proto )
 	// NOTE: any user message is really parse at engine, not in client.dll
 	if( svc_num <= svc_lastmsg || svc_num > ( MAX_USER_MESSAGES + svc_lastmsg ))
 	{
-		// out or range
-		Host_Error( "%s: illegible server message %d\n", __func__, svc_num );
+		CL_DropBadUserMessagePacket( msg, svc_num, "out of range" );
 		return;
 	}
 
@@ -2296,7 +2306,10 @@ void CL_ParseUserMessage( sizebuf_t *msg, int svc_num, connprotocol_t proto )
 	}
 
 	if( i == MAX_USER_MESSAGES ) // probably unregistered
-		Host_Error( "%s: illegible server message %d\n", __func__, svc_num );
+	{
+		CL_DropBadUserMessagePacket( msg, svc_num, "unregistered" );
+		return;
+	}
 
 	// NOTE: some user messages handled into engine
 	if( !Q_strcmp( clgame.msg[i].name, "ScreenShake" ))
@@ -2322,7 +2335,13 @@ void CL_ParseUserMessage( sizebuf_t *msg, int svc_num, connprotocol_t proto )
 
 	if( iSize >= MAX_USERMSG_LENGTH )
 	{
-		Con_Reportf( "%s: user message %s size limit hit (%d > %d)!\n", __func__, clgame.msg[i].name, iSize, MAX_USERMSG_LENGTH );
+		CL_DropBadUserMessagePacket( msg, svc_num, "size limit hit" );
+		return;
+	}
+
+	if( iSize < 0 || iSize > MSG_GetNumBytesLeft( msg ))
+	{
+		CL_DropBadUserMessagePacket( msg, svc_num, "truncated payload" );
 		return;
 	}
 
@@ -2430,7 +2449,8 @@ void CL_ParseServerMessage( sizebuf_t *msg )
 	{
 		if( MSG_CheckOverflow( msg ))
 		{
-			Host_Error( "%s: overflow!\n", __func__ );
+			Con_Printf( S_ERROR "%s: dropping malformed packet: overflow at %d/%d bytes\n",
+				__func__, MSG_GetNumBytesRead( msg ), MSG_GetMaxBytes( msg ));
 			return;
 		}
 

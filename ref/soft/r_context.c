@@ -14,6 +14,16 @@ GNU General Public License for more details.
 */
 
 #include "r_local.h"
+#include "canvas.h"  // Canvas API
+
+// Forward declaration for Canvas getter (implemented in ref/gl/canvas_gl.c for GL, soft may stub or share)
+extern canvas_t *R_GetCanvas( void );
+
+// Stub for software renderer (full Canvas is GL-only for now)
+static canvas_t *R_SoftGetCanvas( void )
+{
+	return NULL;  // Canvas not supported in soft renderer
+}
 
 ref_api_t     gEngfuncs;
 ref_globals_t *gpGlobals;
@@ -545,6 +555,8 @@ static const ref_interface_t gReffuncs =
 	TriGetMatrix,
 	TriFogParams,
 	TriCullFace,
+
+	R_SoftGetCanvas,   // Canvas API (stub for soft renderer)
 
 	VGUI_SetupDrawing,
 	VGUI_UploadTextureBlock,

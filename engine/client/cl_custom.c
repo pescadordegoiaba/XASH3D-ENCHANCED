@@ -52,7 +52,7 @@ static void CL_NormalizeDownloadPath( char *path )
 
 qboolean CL_CheckFile( sizebuf_t *msg, resource_t *pResource )
 {
-	char	filepath[MAX_QPATH];
+	char	filepath[MAX_SYSPATH];
 
 	switch( pResource->type )
 	{

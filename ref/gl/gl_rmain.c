@@ -21,6 +21,10 @@ GNU General Public License for more details.
 */
 
 #include "gl_local.h"
+#include "canvas.h"  // Canvas 2D API integration
+
+// Prototype for the Canvas getter implemented in canvas_gl.c
+canvas_t *R_GetCanvas( void );
 #include "xash3d_mathlib.h"
 #include "library.h"
 #include "beamdef.h"
@@ -32,8 +36,7 @@ GNU General Public License for more details.
 float		gldepthmin, gldepthmax;
 ref_instance_t	RI;
 
-cvar_t *cl_walltrans = NULL;
-cvar_t *cl_chams_ignore_depth = NULL;
+cvar_t *cl_walltrans = NULL;  // legacy visibility cvar (kept for compatibility)
 
 /*
 ================
@@ -999,17 +1002,6 @@ for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
     Assert( RI.currententity != NULL );
     Assert( RI.currentmodel != NULL );
 
-    // ====================== CHAMS WALLHACK PURO (desativa depth só no boneco inimigo) ======================
-    qboolean chams_ignore = (cl_chams_ignore_depth && cl_chams_ignore_depth->value > 0.0f &&
-                             RI.currententity->player);
-
-    if( chams_ignore )
-    {
-        pglDisable( GL_DEPTH_TEST );
-        pglDepthMask( GL_FALSE );
-        pglDepthFunc( GL_ALWAYS );
-    }
-
     switch( RI.currentmodel->type )
     {
     case mod_brush:
@@ -1023,13 +1015,6 @@ for( i = 0; i < tr.draw_list->num_solid_entities && !RI.onlyClientDraw; i++ )
         break;
     default:
         break;
-    }
-
-    if( chams_ignore )
-    {
-        pglEnable( GL_DEPTH_TEST );
-        pglDepthMask( GL_TRUE );
-        pglDepthFunc( GL_LEQUAL );
     }
 }
 
@@ -1220,12 +1205,9 @@ R_BeginFrame
 */
 void R_BeginFrame( qboolean clearScene )
 {
-	// ====================== REGISTRO DOS CVARS WALLHACK/CHAMS ======================
+	// Legacy visibility cvars (for compatibility)
     if( !cl_walltrans )
-     cl_walltrans = gEngfuncs.Cvar_Get( "cl_walltrans", "0", 0, "wall transparency for chams wallhack" );
-
-    if( !cl_chams_ignore_depth )
-     cl_chams_ignore_depth = gEngfuncs.Cvar_Get( "cl_chams_ignore_depth", "0", 0, "ignore depth test for chams players" );
+     cl_walltrans = gEngfuncs.Cvar_Get( "cl_walltrans", "0", 0, "legacy transparency" );
 
 	// ====================== VBO: alterna apenas quando o cvar MUDA ======================
 	// FPS-FIX #9: chamar R_EnableVBO() todo frame tem custo de overhead desnecessario.
@@ -1259,6 +1241,10 @@ void R_BeginFrame( qboolean clearScene )
 		R_SetTextureParameters();
 
 	gEngfuncs.CL_ExtraUpdate ();
+
+	// Canvas users should bracket their own draw calls with BeginFrame/EndFrame
+	// while 2D projection is active. Do not keep Canvas state active globally;
+	// it disables depth/cull/blend state and would contaminate later passes.
 }
 
 /*
@@ -1352,6 +1338,7 @@ void R_EndFrame( void )
 #endif
 	// flush any remaining 2D bits
 	R_Set2DMode( false );
+
 	gEngfuncs.GL_SwapBuffers();
 }
 

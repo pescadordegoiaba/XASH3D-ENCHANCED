@@ -17,6 +17,10 @@ GNU General Public License for more details.
 #define APIENTRY_LINKAGE
 #include "gl_local.h"
 #include "gl_export.h"
+#include "canvas.h"  // Canvas API implementation
+
+// Forward declaration for the Canvas getter (implemented in canvas_gl.c)
+extern canvas_t *R_GetCanvas( void );
 
 #if XASH_GL4ES
 #include "gl4es/include/gl4esinit.h"
@@ -559,6 +563,8 @@ static const ref_interface_t gReffuncs =
 	TriGetMatrix,
 	TriFogParams,
 	TriCullFace,
+
+	R_GetCanvas,   // Canvas API
 
 	VGUI_SetupDrawing,
 	VGUI_UploadTextureBlock,

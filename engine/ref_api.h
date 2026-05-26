@@ -19,15 +19,21 @@ GNU General Public License for more details.
 #include <stdarg.h>
 #include "com_image.h"
 #include "vgui_api.h"
+#include "const.h"          // must come before render_api.h and triangleapi.h because they use colorVec
 #include "render_api.h"
 #include "triangleapi.h"
-#include "const.h"
 #include "cl_entity.h"
 #include "com_model.h"
 #include "studio.h"
 #include "r_efx.h"
 #include "filesystem.h"
 #include "common/protocol.h"
+
+// Forward declarations so ref_api.h can be included by both engine and renderer modules
+// without pulling in conflicting headers.
+struct canvas_s;
+typedef struct canvas_s canvas_t;
+
 #include "cvardef.h"
 #include "q_client.h"
 
@@ -670,6 +676,9 @@ typedef struct ref_interface_s
 	void	(*GetMatrix)( const int pname, float *matrix );
 	void	(*FogParams)( float flDensity, int iFogSkybox );
 	void    (*CullFace)( TRICULLSTYLE mode );
+
+	// Canvas API - high level 2D drawing for clean player outlines and modern HUDs
+	canvas_t* (*GetCanvas)( void );
 
 	// vgui drawing implementation
 	void	(*VGUI_SetupDrawing)( qboolean rect );

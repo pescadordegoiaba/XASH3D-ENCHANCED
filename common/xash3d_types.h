@@ -10,9 +10,9 @@
 #include "port.h"
 
 #define MAX_STRING    256  // generic string
-#define MAX_VA_STRING 1024 // compatibility macro
-#define MAX_SYSPATH   1024 // system filepath
-#define MAX_OSPATH    260 // max length of a filesystem pathname
+#define MAX_VA_STRING 4096 // compatibility macro
+#define MAX_SYSPATH   4096 // system filepath
+#define MAX_OSPATH    260 // legacy fixed-size filesystem pathname
 #define CS_SIZE       64  // size of one config string
 #define CS_TIME	      16  // size of time string
 

@@ -139,9 +139,9 @@ typedef enum instance_e
 #define MAX_STATIC_ENTITIES	32	// static entities that moved on the client when level is spawn
 #endif
 
-#define MAX_SERVERINFO_STRING 512  // server handles too many settings. expand to 1024?
-#define MAX_PRINT_MSG         8192 // how many symbols can handle single call of Con_Printf or Con_DPrintf
-#define MAX_TOKEN             2048 // parse token length
+#define MAX_SERVERINFO_STRING 2048 // server handles too many settings
+#define MAX_PRINT_MSG         16384 // how many symbols can handle single call of Con_Printf or Con_DPrintf
+#define MAX_TOKEN             4096 // parse token length
 #define MAX_USERMSG_LENGTH    2048 // don't modify it's relies on a client-side definitions
 
 #define GameState		(&host.game)

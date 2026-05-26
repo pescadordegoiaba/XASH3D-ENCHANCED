@@ -76,7 +76,7 @@ CVAR_DEFINE_AUTO( cl_showevents, "0", FCVAR_ARCHIVE, "show events playback" );
 CVAR_DEFINE_AUTO( cl_cmdrate, "30", FCVAR_ARCHIVE, "Max number of command packets sent to server per second" );
 CVAR_DEFINE( cl_interp, "ex_interp", "0.1", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "Interpolate object positions starting this many seconds in past" );
 CVAR_DEFINE_AUTO( cl_nointerp, "0", 0, "disable interpolation of entities and players" );
-static CVAR_DEFINE_AUTO( cl_dlmax, "0", FCVAR_USERINFO|FCVAR_ARCHIVE, "max allowed outcoming fragment size" );
+static CVAR_DEFINE_AUTO( cl_dlmax, "1200", FCVAR_USERINFO|FCVAR_ARCHIVE, "max allowed outcoming fragment size" );
 static CVAR_DEFINE_AUTO( cl_upmax, "508", FCVAR_ARCHIVE, "max allowed incoming fragment size" );
 
 CVAR_DEFINE_AUTO( cl_lw, "1", FCVAR_ARCHIVE|FCVAR_USERINFO, "enable client weapon predicting" );
@@ -258,14 +258,17 @@ static int CL_GetGoldSrcFragmentSize( void *unused, fragsize_t mode )
 	case FRAGSIZE_UNRELIABLE:
 		return 1400; // MAX_ROUTABLE_PACKET
 	default:
-		if( cls.state == ca_active )
-		{
-			// GoldSrc's default value is 512
-			// let's help users to not shoot themselves in the foot,
-			// assuming nobody wants to make this value lower
-			return bound( 512, cl_dlmax.value, 1024 );
-		}
-		return 128;
+	{
+		int fragment_size = (int)cl_dlmax.value;
+
+		if( fragment_size <= 0 )
+			fragment_size = 1024;
+
+		// GoldSrc servers do not negotiate NET_EXT_SPLITSIZE. Keep the
+		// legacy-safe upper bound, but avoid the old 128 byte pre-active
+		// fallback that makes dlfile downloads extremely slow.
+		return bound( 512, fragment_size, 1024 );
+	}
 	}
 }
 
