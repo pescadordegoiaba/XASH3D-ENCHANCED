@@ -1,148 +1,170 @@
-# Xash3D FWGS Engine <img align="right" width="128" height="128" src="https://github.com/FWGS/xash3d-fwgs/raw/master/game_launch/icon-xash-material.png" alt="Xash3D FWGS icon" />
-[![GitHub Actions Status](https://github.com/FWGS/xash3d-fwgs/actions/workflows/c-cpp.yml/badge.svg)](https://github.com/FWGS/xash3d-fwgs/actions/workflows/c-cpp.yml) [![FreeBSD Build Status](https://img.shields.io/cirrus/github/FWGS/xash3d-fwgs?label=freebsd%20build)](https://cirrus-ci.com/github/FWGS/xash3d-fwgs) \
-[![Discord Server](https://img.shields.io/discord/355697768582610945?logo=Discord&label=International%20Discord%20chat)](http://xash.su/discord/) [![Russian speakers Telegram Chat](https://img.shields.io/badge/Russian_speakers_Telegram_chat-gray?logo=Telegram)](https://t.me/flyingwithgauss) \
-[![Download Daily Build](https://img.shields.io/badge/downloads-testing-orange)](https://github.com/FWGS/xash3d-fwgs/releases/tag/continuous)
+# Xash3D ENCHANCED Engine
 
-Xash3D ([pronounced](https://ipa-reader.com/?text=ks%C9%91%CA%82) `[ksɑʂ]`) FWGS is a game engine, aimed to provide compatibility with Half-Life Engine and extend it, as well as to give game developers well known workflow.
+Fork do Xash3D FWGS focado em Counter-Strike 1.6 no Windows e Linux, mantendo compatibilidade com servidores GoldSrc antigos e servidores Xash3D/modernos.
 
-Xash3D FWGS is a heavily modified fork of an original [Xash3D Engine](https://www.moddb.com/engines/xash3d-engine) by Unkle Mike.
+Este repositório remove do guia principal instruções de plataformas fora do alvo deste fork. O foco documentado aqui é:
 
-## Donate
-[![Donate to FWGS button](https://img.shields.io/badge/Donate_to_FWGS-%3C3-magenta)](Documentation/donate.md) \
-If you like Xash3D FWGS, consider supporting individual engine maintainers. By supporting us, you help to continue developing this game engine further. The sponsorship links are available in [documentation](Documentation/donate.md).
+- Windows 32-bit.
+- Linux 32-bit em sistemas x86/x86_64.
+- Compatibilidade com servidores antigos e novos.
+- Melhor robustez para downloads, mensagens de rede, HUD e renderização.
 
-## Fork features
-* Steam Half-Life (HLSDK 2.5) support.
-* Crossplatform and modern compilers support: supports Windows, Linux, BSD & Android on x86 & ARM and [many more](Documentation/ports.md).
-* Better multiplayer: multiple master servers, headless dedicated server, voice chat, [GoldSrc protocol support](Documentation/goldsrc-protocol-support.md) and IPv6 support.
-* Multiple renderers support: OpenGL, GLESv1, GLESv2 and Software.
-* Advanced virtual filesystem: `.pk3` and `.pk3dir` support, compatibility with GoldSrc FS module, fast case-insensitivity emulation for crossplatform.
-* Mobility API: better game integration on mobile devices (vibration, touch controls).
-* Different input methods: touch and gamepad in addition to mouse & keyboard.
-* TrueType font rendering, as a part of mainui_cpp.
-* External VGUI support module.
-* PNG & KTX2 image format support.
-* Ogg Vorbis (`.ogg`) & Ogg Opus (`.opus`) audio formats support.
-* [A set of small improvements](Documentation/), without broken compatibility.
+## Alteracoes Do Fork Por Data
 
-## Installation & Running
-0) Get Xash3D FWGS binaries: you can use [testing](https://github.com/FWGS/xash3d-fwgs/releases/tag/continuous) build or you can compile engine from source code.
-1) Copy engine binaries to some directory.
-2) Copy `valve` directory from [Half-Life](https://store.steampowered.com/app/70/HalfLife/) to directory with engine binaries.
-If your CPU is NOT x86 compatible or you're running 64-bit version of the engine, you may want to compile [Half-Life SDK](https://github.com/FWGS/hlsdk-portable).
-This repository contains our fork of HLSDK and restored source code for Half-Life expansions and some mods.
-You still needed to copy `valve` directory as all game resources located there.
-3) Run the main executable (`xash3d.exe` or AppImage).
+### 2026-05-26
 
-For additional info, run Xash3D with `-help` command line key.
+#### Downloads e rede
 
-### Android
-0) Install the APK file.
-1) Copy `valve` directory to a folder named `xash` in the Internal storage.
-2) Run games from within the app.
+- Aumentado o paralelismo padrao do downloader HTTP/FastDL:
+  - `http_maxconnections` passou de `6` para `12`.
+  - `http_max_active_requests` passou de `6` para `12` quando o backend libcurl estiver disponivel.
+- `cl_dlmax` agora usa `1200` como padrao, anunciando um tamanho de fragmento mais adequado para conexoes atuais.
+- O fallback GoldSrc `dlfile` deixou de usar o caminho pre-active de `128 bytes`; agora usa fragmentos de ate `1024 bytes`, mantendo limite conservador para servidores antigos.
+- Corrigido truncamento de caminho em `CL_CheckFile`: o buffer temporario deixou de usar `MAX_QPATH` e passou a usar `MAX_SYSPATH`, evitando problemas com caminhos como `sound/` + nome longo.
+- Recursos genericos agora mantem o estado de download pendente enquanto o arquivo ainda nao terminou, evitando tentativa de precache cedo demais.
 
-## Reporting issues
-* Issues are accepted in both English and Russian.
-* They are only accepted if you run legally acquired product (e.g. Half-Life in Steam).
+#### Tolerancia a pacotes malformados
 
-## Contributing code
-* Check the CONTRIBUTING.md file.
+- Mensagens de usuario invalidas, nao registradas, fora de faixa ou truncadas agora sao descartadas com log em vez de derrubar o cliente com `Host_Error`.
+- Overflows em parser GoldSrc/Xash agora descartam o pacote malformado em vez de encerrar a sessao inteira.
+- Isso melhora compatibilidade com servidores que enviam mensagens quebradas, plugins ruidosos ou respostas externas inesperadas.
 
-## Build instructions
-We are using Waf build system. If you have some Waf-related questions, I recommend you to read [Waf Book](https://waf.io/book/).
+#### Limites internos
 
-**NOTE: NEVER USE GitHub's ZIP ARCHIVES. GitHub doesn't include external dependencies we're using!**
+- Aumentados limites seguros de strings internas:
+  - `MAX_VA_STRING` para `4096`.
+  - `MAX_SYSPATH` para `4096`.
+  - `MAX_SERVERINFO_STRING` para `2048`.
+  - `MAX_PRINT_MSG` para `16384`.
+  - `MAX_TOKEN` para `4096`.
+- `MAX_STRING` e `MAX_OSPATH` foram mantidos conservadores para nao quebrar layouts, saves e estruturas antigas.
 
-### Prerequisites
-If your CPU is x86 compatible and you're on Windows or Linux, we are building 32-bit code by default. This was done to maintain compatibility with Steam releases of Half-Life and based on it's engine games.
-Even if Xash3D FWGS does support targetting 64-bit, you can't load games without recompiling them from source code!
+#### Renderizacao e Canvas
 
-If your CPU is NOT x86 compatible or you decided build 64-bit version of engine, you may want to compile [Half-Life SDK](https://github.com/FWGS/hlsdk-portable).
-This repository contains our fork of HLSDK and restored source code for Half-Life expansions and some mods.
+- Adicionada API `Canvas` 2D no renderer GL para overlays e HUDs modernos.
+- Adicionado stub seguro para renderer software.
+- Corrigido estado OpenGL do Canvas para salvar/restaurar depth, culling, blend e scissor.
+- Removido uso global incorreto de `Canvas_BeginFrame`/`Canvas_EndFrame` no render principal.
+- Adicionado `Documentation/canvas_usage.md` com exemplos e diretrizes de uso.
 
-#### Windows (Visual Studio)
-* Install Visual Studio.
-* Install latest [Python](https://python.org) **OR** run `cinst python.install` if you have Chocolatey.
-* Install latest [Git](https://git-scm.com/download/win) **OR** run `cinst git.install` if you have Chocolatey.
-* Download [SDL2](https://libsdl.org/download-2.0.php) development package for Visual Studio.
-* Clone this repository: `git clone --recursive https://github.com/FWGS/xash3d-fwgs`.
-* Make sure you have at least 12GB of free space to store all build-time dependencies: ~10GB for Visual Studio, 300 MB for Git, 100 MB for Python and other.
+#### Compatibilidade de build
 
-#### GNU/Linux
-##### Debian/Ubuntu
-* Only for 32-bit engine on 64-bit x86 operating system:
-  * Enable i386 on your system: `$ sudo dpkg --add-architecture i386`.
-  * Install `aptitude` ([why?](https://github.com/FWGS/xash3d-fwgs/issues/1828#issuecomment-2415131759)):  `$ sudo apt update && sudo apt upgrade && sudo apt install aptitude`
-  * Install development tools: `$ sudo aptitude --without-recommends install git build-essential gcc-multilib g++-multilib libsdl2-dev:i386 libfreetype-dev:i386 libopus-dev:i386 libbz2-dev:i386 libvorbis-dev:i386 libopusfile-dev:i386 libogg-dev:i386`.
-  * Set PKG_CONFIG_PATH environment variable to point at 32-bit libraries: `$ export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig`.
+- Adicionado stub `engine/avi/avi.h` para manter includes de AVI consistentes quando o modulo completo nao estiver no include path.
 
-* For 64-bit engine on 64-bit x86 and other non-x86 systems:
-  * Install development tools: `$ sudo apt install git build-essential python libsdl2-dev libfreetype6-dev libopus-dev libbz2-dev libvorbis-dev libopusfile-dev libogg-dev`.
+### 2026-05-02
 
-* Clone this repostory: `$ git clone --recursive https://github.com/FWGS/xash3d-fwgs`.
+Alteracoes ja documentadas anteriormente neste fork:
 
-##### RedHat/Fedora
-* Only for 32-bit engine on 64-bit x86 operating system:
-  * Install development tools: `$ sudo dnf install git gcc gcc-c++ glibc-devel.i686 SDL3-devel.i686 sdl2-compat-devel.i686 opus-devel.i686 freetype-devel.i686 bzip2-devel.i686 libvorbis-devel.i686 opusfile-devel.i686 libogg-devel.i686`.
-  * Set PKG_CONFIG_PATH environment variable to point at 32-bit libraries: `$ export PKG_CONFIG_PATH=/usr/lib/pkgconfig`.
+- `cl_walltrans 1`: atualizacao OpenGL mantida desativada por padrao para compatibilidade.
+- `r_fullbright 1`: reativado para servidores dedicados.
+- `aspect_ratio 0.1 - 2`: permite alterar proporcao sem alterar resolucao.
+- Extensoes iniciais de buffer para reduzir risco de overflow.
+- Melhorias iniciais no fluxo de renderizacao grafica.
 
-* For 64-bit engine on 64-bit x86 and other non-x86 systems:
-  * Install development tools: `$ sudo dnf install git gcc gcc-c++ SDL3-devel sdl2-compat-devel opus-devel freetype-devel bzip2-devel libvorbis-devel opusfile-devel libogg-devel`.
+## Instalacao E Execucao
 
-* Clone this repostory: `$ git clone --recursive https://github.com/FWGS/xash3d-fwgs`.
+1. Compile ou baixe os binarios deste fork.
+2. Copie os binarios da engine para uma pasta de jogo.
+3. Copie as pastas do Half-Life/Counter-Strike instalados legalmente, como `valve` e `cstrike`, para a mesma pasta.
+4. Execute:
+   - Windows: `xash3d.exe`
+   - Linux: `./xash3d`
 
-#### Android (Windows/Linux/macOS)
-* Install [Android Studio](https://developer.android.com/studio) (or the command line tools).
-* Install [Python](https://python.org) (at least 2.7, latest is better).
-* Install [Git](https://git-scm.com/download/win).
-* Install [Ninja](https://ninja-build.org/).
-* Install [CMake](https://cmake.org/) (for some dependencies).
+Para ver opcoes de inicializacao:
 
-* Clone this repostory: `$ git clone --recursive https://github.com/FWGS/xash3d-fwgs`.
+```sh
+./xash3d -help
+```
 
-#### iOS/iPadOS🏳️‍🌈
-* Install Xcode from the appstore.
-* Install [Homebrew package manager](https://brew.sh).
+## Build
 
-* Install build dependencies by running: `brew install python`.
+Este projeto usa Waf.
 
-* Clone the SDL2 repo `$ git clone --recursive https://github.com/libsdl-org/SDL.git -b SDL2` and compile the iOS framework by navigating to SDL/Xcode/SDL and opening the Xcode project.
+Nunca use o ZIP gerado pelo GitHub para build completo, porque dependencias externas/submodules podem nao vir junto. Clone com `--recursive`.
 
-* Clone this repository: `$ git clone --recursive https://github.com/FWGS/xash3d-fwgs`.
+### Windows
 
-### Building
-#### Windows (Visual Studio)
-0) Open command line.
-1) Navigate to `xash3d-fwgs` directory.
-2) (optional) Examine which build options are available: `waf --help`.
-3) Configure build: `waf configure --sdl2=c:/path/to/SDL2`.
-4) Compile: `waf build`.
-5) Install: `waf install --destdir=c:/path/to/any/output/directory`.
+Requisitos:
 
-#### Linux
-If compiling 32-bit on amd64, make sure `PKG_CONFIG_PATH` from the previous step is set correctly, prior to running configure.
+- Visual Studio.
+- Python.
+- Git.
+- SDL2 development package para Visual Studio.
 
-0) (optional) Examine which build options are available: `./waf --help`.
-1) Configure build: `./waf configure` (you need to pass `-8` to compile 64-bit engine on 64-bit x86 processor).
-2) Compile: `./waf build`.
-3) Install: `./waf install --destdir=/path/to/any/output/directory`.
+Build:
 
-#### Android (Windows/Linux/macOS)
-To build you should clone [SDL](https://github.com/libsdl-org/SDL) from `SDL2` branch and [HLSDK-portable](https://github.com/FWGS/hlsdk-portable) `mobile-hacks` branch repositories to 3rdparty folder, after that you should be able to open the project in Android Studio from `android` directory or manually call Gradle to build the APK.
+```bat
+git clone --recursive https://github.com/pescadordegoiaba/XASH3D-ENCHANCED.git
+cd XASH3D-ENCHANCED
+waf configure --sdl2=c:/path/to/SDL2
+waf build
+waf install --destdir=c:/path/to/output
+```
 
-#### iOS/iPadOS (MacOS only)
-0) (optional) Examine which build options are available: `./waf --help`.
-1) Configure build: `./waf configure --ios --enable-bundled-deps --sdl2 (path/to/SDL2.framework)`, set `--ios-simulator` instead of `--ios` if you want to build for simulator.
-2) Compile `./waf build`.
-3) Navigate to `build` and copy your compiled SDL2.framework there, then add your client dylibs to `build/ios/cl_dlls` and any other dylibs to `build/ios/dlls` (You can also run `scripts/ios/buildhlsdk.sh` instead to automatically create an ipa with hlsdk dylibs)
-4) Run `scripts/ios/createipa.sh` to create an installable ipa
+### Linux
 
+#### Debian/Ubuntu 32-bit em sistema 64-bit
 
-#### New Commands
-* cl_walltrans 1   (Opengl Update, disabled for compatiblity)
-* r_fullbright 1 (Reactivated for Dedicated Servers)
-* aspect_ratio 0.1 - 2 (Change Aspect Ration Without Change Resolution
+```sh
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt install aptitude
+sudo aptitude --without-recommends install git build-essential gcc-multilib g++-multilib libsdl2-dev:i386 libfreetype-dev:i386 libopus-dev:i386 libbz2-dev:i386 libvorbis-dev:i386 libopusfile-dev:i386 libogg-dev:i386
+export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+git clone --recursive https://github.com/pescadordegoiaba/XASH3D-ENCHANCED.git
+cd XASH3D-ENCHANCED
+./waf configure
+./waf build
+```
 
-### FIX
-* Limit Of Buffer extended for improve buffer overflow fix
-* Improvements In To Render Graphic
+#### Fedora
+
+```sh
+sudo dnf install git gcc gcc-c++ glibc-devel.i686 SDL3-devel.i686 sdl2-compat-devel.i686 opus-devel.i686 freetype-devel.i686 bzip2-devel.i686 libvorbis-devel.i686 opusfile-devel.i686 libogg-devel.i686
+export PKG_CONFIG_PATH=/usr/lib/pkgconfig
+git clone --recursive https://github.com/pescadordegoiaba/XASH3D-ENCHANCED.git
+cd XASH3D-ENCHANCED
+./waf configure
+./waf build
+```
+
+#### Arch/Manjaro
+
+Habilite `multilib` em `/etc/pacman.conf`:
+
+```ini
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+```
+
+Instale dependencias comuns:
+
+```sh
+sudo pacman -Syu
+sudo pacman -S git base-devel python sdl2 lib32-sdl2 lib32-mesa lib32-libglvnd lib32-freetype2 lib32-bzip2 lib32-libvorbis lib32-libogg
+git clone --recursive https://github.com/pescadordegoiaba/XASH3D-ENCHANCED.git
+cd XASH3D-ENCHANCED
+./waf configure
+./waf build
+```
+
+## CVars Relevantes Do Fork
+
+```cfg
+http_maxconnections 12
+http_max_active_requests 12
+cl_dlmax 1200
+cl_walltrans 0
+r_fullbright 1
+aspect_ratio 1
+```
+
+## Reportando Problemas
+
+Ao reportar um bug, informe:
+
+- Sistema operacional.
+- Se o binario e 32-bit ou 64-bit.
+- Mapa e servidor usado.
+- Log completo do console.
+- Valor de `cl_dlmax`, `http_maxconnections` e `http_max_active_requests` se o problema envolver download.
