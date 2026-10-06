@@ -279,12 +279,16 @@ static void SDLash_EventHandler( SDL_Event *event )
 	{
 	/* Mouse events */
 	case SDL_MOUSEMOTION:
+		if( Evdev_OwnsPointer( ))
+			break;
 		if( host.mouse_visible )
 			SDL_GetRelativeMouseState( NULL, NULL );
 		break;
 
 	case SDL_MOUSEBUTTONUP:
 	case SDL_MOUSEBUTTONDOWN:
+		if( Evdev_OwnsPointer( ))
+			break;
 		SDLash_MouseEvent( event->button );
 		break;
 
@@ -298,6 +302,8 @@ static void SDLash_EventHandler( SDL_Event *event )
 		Sys_Quit( "caught SDL_QUIT" );
 		break;
 	case SDL_MOUSEWHEEL:
+		if( Evdev_OwnsPointer( ))
+			break;
 		IN_MWheelEvent( event->wheel.y );
 		break;
 

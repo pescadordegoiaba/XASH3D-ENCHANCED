@@ -47,6 +47,12 @@ void IN_EngineAppendMove( float frametime, usercmd_t *cmd, qboolean active );
 void IN_SetRelativeMouseMode( qboolean set );
 void IN_SetMouseGrab( qboolean set );
 
+// Linux /dev/input. OwnsPointer is true only while the game holds the device.
+qboolean Evdev_OwnsPointer( void );
+qboolean Evdev_CursorPos( int *x, int *y );
+void Evdev_SetCursorPos( int x, int y );
+void Evdev_DrawCursor( void );
+
 extern convar_t m_yaw;
 extern convar_t m_pitch;
 extern convar_t touch_enable;

@@ -3449,6 +3449,7 @@ static void CL_InitLocal( void )
 	Q_strncpy( username, Sys_GetCurrentUser(), sizeof( username ));	// initialize before registering variable
 	Cvar_RegisterVariable( &name );
 	Cvar_Get( "ui_username", username, FCVAR_READ_ONLY|FCVAR_PRIVILEGED, "default user name" );
+	Cvar_Get( "esp_offline", "0", FCVAR_READ_ONLY, "1 only for a local listen server with no remote human players" );
 	Cvar_RegisterVariable( &model );
 	Cvar_RegisterVariable( &cl_updaterate );
 	Cvar_RegisterVariable( &cl_dlmax );

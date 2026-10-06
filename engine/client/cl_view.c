@@ -28,6 +28,14 @@ GNU General Public License for more details.
 #include "sound.h"
 #include "input.h" // touch
 #include "platform/platform.h" // GL_UpdateSwapInterval
+#include "server.h"
+#include "esp_local.h"
+#include <SDL.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
 
 /*
 ===============
@@ -505,6 +513,231 @@ static void R_ShowTree( void )
 	Con_NPrintf( 0, "max recursion %d\n", world.max_recursion );
 }
 
+static int ESP_TeamFromModel( const char *model )
+{
+	if( !model || !model[0] )
+		return 0;
+	if( Q_stristr( model, "terror" ) || Q_stristr( model, "leet" )
+		|| Q_stristr( model, "arctic" ) || Q_stristr( model, "guerilla" )
+		|| Q_stristr( model, "militia" ))
+		return 1;
+	if( Q_stristr( model, "urban" ) || Q_stristr( model, "gsg9" )
+		|| Q_stristr( model, "sas" ) || Q_stristr( model, "gign" )
+		|| Q_stristr( model, "vip" ))
+		return 2;
+	return 0;
+}
+
+static void ESP_CopyName( char *dst, size_t n, const char *src )
+{
+	size_t i;
+
+	if( !src )
+		src = "";
+	for( i = 0; i + 1 < n && src[i]; i++ )
+		dst[i] = ( src[i] >= 32 && src[i] < 127 ) ? src[i] : ' ';
+	dst[i] = 0;
+}
+
+/* Local listen server, bots allowed. A remote human client turns this off. */
+static qboolean ESP_OfflineSession( void )
+{
+	int i;
+
+	if( !SV_Active() || sv.state != ss_active || sv.background )
+		return false;
+	if( cls.state != ca_active || !svs.initialized || !svs.clients || svs.maxclients < 1 )
+		return false;
+
+	for( i = 0; i < svs.maxclients; i++ )
+	{
+		sv_client_t *cl = &svs.clients[i];
+
+		if( cl->state < cs_connected )
+			continue;
+		if( FBitSet( cl->flags, FCL_FAKECLIENT ))
+			continue;
+		if( !NET_IsLocalAddress( cl->netchan.remote_address ))
+			return false;
+	}
+
+	return true;
+}
+
+static void ESP_UpdateOfflineCvar( void )
+{
+	static convar_t *cv;
+	const char *next;
+
+	if( !cv )
+		cv = Cvar_FindVar( "esp_offline" );
+	if( !cv )
+		return;
+
+	next = ESP_OfflineSession() ? "1" : "0";
+	if( cv->string && cv->string[0] == next[0] && cv->string[1] == '\0' )
+		return;
+
+	Cvar_DirectFullSet( cv, next, FCVAR_READ_ONLY );
+}
+
+/* Publish avatar positions for the external overlay. Only a listen server
+   running in this process (offline, bots included) writes real data. */
+static void ESP_PublishLocal( void )
+{
+	static esp_frame_t *frame;
+	static int fd = -1;
+	esp_frame_t local;
+	struct timespec ts;
+	uint32_t odd;
+	int i, n, count;
+
+	if( fd < 0 )
+	{
+		fd = open( ESP_PATH, O_RDWR | O_CREAT, 0600 );
+		if( fd < 0 )
+			return;
+		if( ftruncate( fd, sizeof( *frame )) < 0 )
+			return;
+		frame = mmap( NULL, sizeof( *frame ), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+		if( frame == MAP_FAILED )
+		{
+			frame = NULL;
+			return;
+		}
+		memset( frame, 0, sizeof( *frame ));
+		frame->magic = ESP_MAGIC;
+	}
+	if( !frame )
+		return;
+
+	memset( &local, 0, sizeof( local ));
+	local.magic = ESP_MAGIC;
+	clock_gettime( CLOCK_MONOTONIC, &ts );
+	local.time_ms = (uint32_t)( ts.tv_sec * 1000u + ts.tv_nsec / 1000000u );
+
+	if( host.hWnd )
+	{
+		SDL_GetWindowPosition( (SDL_Window *)host.hWnd, &local.win_x, &local.win_y );
+		SDL_GetWindowSize( (SDL_Window *)host.hWnd, &local.win_w, &local.win_h );
+	}
+	if( local.win_w < 2 || local.win_h < 2 )
+	{
+		local.win_w = refState.width;
+		local.win_h = refState.height;
+	}
+
+	/* Remote sessions publish an empty entity list. */
+	if( clgame.entities && ESP_OfflineSession() )
+	{
+		float fov_x, fov_y;
+		int vp_w, vp_h;
+
+		VectorCopy( refState.vieworg, local.vieworg );
+		VectorCopy( refState.viewangles, local.viewangles );
+
+		vp_w = clgame.viewport[2] > 0 ? clgame.viewport[2] : refState.width;
+		vp_h = clgame.viewport[3] > 0 ? clgame.viewport[3] : refState.height;
+		fov_x = bound( 10.0f, cl.local.scr_fov, 150.0f );
+		fov_y = V_CalcFov( &fov_x, vp_w, vp_h );
+		if( refState.wideScreen && r_adjust_fov.value )
+			V_AdjustFov( &fov_x, &fov_y, vp_w, vp_h, false );
+		local.fov_x = fov_x;
+		local.fov_y = fov_y;
+
+		n = cl.maxclients;
+		if( n < 1 )
+			n = clgame.maxEntities - 1;
+		if( n > ESP_MAX )
+			n = ESP_MAX;
+		if( n > clgame.maxEntities - 1 )
+			n = clgame.maxEntities - 1;
+
+		count = 0;
+		for( i = 1; i <= n && count < ESP_MAX; i++ )
+		{
+			cl_entity_t *ent = &clgame.entities[i];
+			esp_ent_t *out;
+			const char *mdl = "";
+			edict_t *ed;
+			int team;
+
+			if( i == cl.playernum + 1 )
+				continue;
+			if( !ent->model || ent->model->type != mod_studio )
+				continue;
+			if( FBitSet( ent->curstate.effects, EF_NODRAW ))
+				continue;
+			if( !ent->player && !Q_stristr( ent->model->name, "/player/" ))
+				continue;
+
+			out = &local.ent[count];
+			VectorCopy( ent->origin, out->origin );
+			if( ent->model->radius > 1.0f )
+			{
+				VectorCopy( ent->model->mins, out->mins );
+				VectorCopy( ent->model->maxs, out->maxs );
+			}
+			else
+			{
+				VectorSet( out->mins, -16, -16, -36 );
+				VectorSet( out->maxs, 16, 16, 36 );
+			}
+
+			ed = SV_EdictNum( i );
+			if( ed && !ed->free )
+			{
+				out->health = (int)ed->v.health;
+				out->dead = ed->v.deadflag ? 1 : 0;
+				team = ed->v.team;
+			}
+			else
+			{
+				out->health = ent->curstate.health;
+				out->dead = out->health <= 0;
+				team = ent->curstate.team;
+			}
+
+			if( i - 1 < MAX_CLIENTS )
+			{
+				ESP_CopyName( out->name, sizeof( out->name ), cl.players[i - 1].name );
+				mdl = cl.players[i - 1].model;
+			}
+			if( !out->name[0] )
+				ESP_CopyName( out->name, sizeof( out->name ), "avatar" );
+			ESP_CopyName( out->model, sizeof( out->model ), mdl[0] ? mdl : ent->model->name );
+
+			if( team != 1 && team != 2 )
+				team = ESP_TeamFromModel( out->model );
+			if( team != 1 && team != 2 )
+				team = ESP_TeamFromModel( ent->model->name );
+			out->team = team;
+			count++;
+		}
+		local.count = count;
+	}
+
+	if( refState.camera_ready )
+	{
+		memcpy( local.camera_mvp, refState.camera_mvp, sizeof( local.camera_mvp ));
+		local.camera_vp[0] = refState.camera_vp[0];
+		local.camera_vp[1] = refState.camera_vp[1];
+		local.camera_vp[2] = refState.camera_vp[2];
+		local.camera_vp[3] = refState.camera_vp[3];
+		local.camera_ready = 1;
+	}
+
+	odd = ( frame->seq + 1u ) | 1u;
+	frame->seq = odd;
+	__sync_synchronize();
+	local.seq = odd;
+	local.magic = ESP_MAGIC;
+	memcpy( (char *)frame + sizeof( uint32_t ) * 2, (char *)&local + sizeof( uint32_t ) * 2,
+		sizeof( local ) - sizeof( uint32_t ) * 2 );
+	__sync_synchronize();
+	frame->seq = odd + 1u;
+}
+
 /*
 ==================
 V_PostRender
@@ -515,6 +748,7 @@ void V_PostRender( void )
 {
 	qboolean		draw_2d = false;
 
+	ESP_UpdateOfflineCvar();
 	ref.dllFuncs.R_AllowFog( false );
 	ref.dllFuncs.R_Set2DMode( true );
 
@@ -558,6 +792,8 @@ void V_PostRender( void )
 	}
 
 	SCR_MakeScreenShot();
+	Evdev_DrawCursor();
+	ESP_PublishLocal();
 	ref.dllFuncs.R_AllowFog( true );
 	Platform_SetTimer( 0.0f );
 	ref.dllFuncs.R_EndFrame();

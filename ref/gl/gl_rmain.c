@@ -706,6 +706,21 @@ void R_SetupGL( qboolean set_gl_state )
 	pglMatrixMode( GL_MODELVIEW );
 	GL_LoadMatrix( RI.worldviewMatrix );
 
+	if( RP_NORMALPASS() && gpGlobals )
+	{
+		int row, col, n = 0;
+
+		for( row = 0; row < 4; row++ )
+			for( col = 0; col < 4; col++ )
+				gpGlobals->camera_mvp[n++] = RI.worldviewProjectionMatrix[row][col];
+
+		gpGlobals->camera_vp[0] = RI.viewport[0];
+		gpGlobals->camera_vp[1] = RI.viewport[1];
+		gpGlobals->camera_vp[2] = RI.viewport[2];
+		gpGlobals->camera_vp[3] = RI.viewport[3];
+		gpGlobals->camera_ready = 1;
+	}
+
 	if( FBitSet( RI.params, RP_CLIPPLANE ))
 	{
 		GLdouble	clip[4];

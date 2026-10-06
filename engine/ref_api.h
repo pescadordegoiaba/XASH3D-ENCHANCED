@@ -166,6 +166,12 @@ typedef struct ref_globals_s
 	// scaling factor of physical window size compared to logical
 	float scale_x;
 	float scale_y;
+
+	// Exact player-view camera for the external overlay. Row-major
+	// worldviewProjectionMatrix, viewport in top-left window pixels.
+	float camera_mvp[16];
+	int camera_vp[4];
+	int camera_ready;
 } ref_globals_t;
 
 typedef struct ref_client_s

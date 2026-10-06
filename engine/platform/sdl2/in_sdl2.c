@@ -43,6 +43,10 @@ Platform_GetMousePos
 */
 void GAME_EXPORT Platform_GetMousePos( int *x, int *y )
 {
+	// Same coordinate space as the scaled SDL position: render pixels.
+	if( Evdev_CursorPos( x, y ))
+		return;
+
 	SDL_GetMouseState( x, y );
 
 	if( x )
@@ -60,6 +64,12 @@ Platform_SetMousePos
 */
 void GAME_EXPORT Platform_SetMousePos( int x, int y )
 {
+	if( Evdev_OwnsPointer( ))
+	{
+		Evdev_SetCursorPos( x, y );
+		return;
+	}
+
 	SDL_WarpMouseInWindow( host.hWnd, x, y );
 }
 
@@ -203,6 +213,13 @@ void Platform_SetCursorType( VGUI_DefaultCursor type )
 
 	host.mouse_visible = visible;
 	VGui_UpdateInternalCursorState( type );
+
+	// The OS cursor cannot track a grabbed /dev/input device (Wayland ignores warps).
+	if( Evdev_OwnsPointer( ))
+	{
+		SDL_ShowCursor( false );
+		return;
+	}
 
 	if( host.mouse_visible )
 	{

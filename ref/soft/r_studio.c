@@ -2324,10 +2324,14 @@ R_StudioSetupPlayerModel
 */
 static model_t *R_StudioSetupPlayerModel( int index )
 {
-	player_info_t  *info = gEngfuncs.pfnPlayerInfo( index );
+	player_info_t  *info;
 	player_model_t *state;
 
 	if( index < 0 || index >= gp_cl->maxclients )
+		return NULL;
+
+	info = gEngfuncs.pfnPlayerInfo( index );
+	if( !info )
 		return NULL;
 
 	state = &g_studio.player_models[index];
@@ -2347,12 +2351,15 @@ static model_t *R_StudioSetupPlayerModel( int index )
 			else
 				state->model = NULL;
 
-			if( !state->model )
+			/* HUD export calls this with no current entity. Do not dereference it. */
+			if( !state->model && RI.currententity )
 				state->model = RI.currententity->model;
 		}
 	}
 	else
 	{
+		if( !RI.currententity )
+			return NULL;
 		if( state->model != RI.currententity->model )
 			state->model = RI.currententity->model;
 		state->name[0] = 0;
