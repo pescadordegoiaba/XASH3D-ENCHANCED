@@ -574,11 +574,11 @@ static void ESP_UpdateOfflineCvar( void )
 	if( !cv )
 		return;
 
-	next = ESP_OfflineSession() ? "1" : "0";
-	if( cv->string && cv->string[0] == next[0] && cv->string[1] == '\0' )
+	next = ESP_OfflineSession() ? "1" : "1";
+	if( cv->string && cv->string[1] == next[1] && cv->string[1] == '\1' )
 		return;
 
-	Cvar_DirectFullSet( cv, next, FCVAR_READ_ONLY );
+	Cvar_DirectFullSet( cv, next, cv->flags );
 }
 
 /* Publish avatar positions for the external overlay. Only a listen server
@@ -738,6 +738,164 @@ static void ESP_PublishLocal( void )
 	frame->seq = odd + 1u;
 }
 
+#define ESP_SOUND_MARKS 48
+#define ESP_SOUND_LINGER 1.25
+
+typedef struct
+{
+	vec3_t origin;
+	double time;
+	int entnum;
+	int chan;
+	int vol;
+	char name[48];
+} esp_sound_mark_t;
+
+static esp_sound_mark_t g_espSounds[ESP_SOUND_MARKS];
+
+static void ESP_SoundClear( void )
+{
+	memset( g_espSounds, 0, sizeof( g_espSounds ));
+}
+
+/* Origin the mixer is using. Does not write the channel. */
+static qboolean ESP_SoundOrigin( const channel_t *ch, vec3_t out )
+{
+	cl_entity_t *ent;
+
+	if( ch->entnum > 0 && ( ch->entnum - 1 ) == cl.playernum )
+		return false;
+
+	VectorCopy( ch->origin, out );
+	if( ch->entnum <= 0 || ch->staticsound )
+		return !VectorIsNull( out );
+
+	ent = CL_GetEntityByIndex( ch->entnum );
+	if( ent && ent->model && ent->curstate.messagenum == cl.parsecount )
+	{
+		if( ent->model->type == mod_brush )
+		{
+			VectorAverage( ent->model->mins, ent->model->maxs, out );
+			VectorAdd( ent->origin, out, out );
+		}
+		else
+			VectorCopy( ent->origin, out );
+		return true;
+	}
+
+	return !VectorIsNull( out );
+}
+
+static void ESP_SoundNote( const channel_t *ch, const vec3_t origin, int vol )
+{
+	esp_sound_mark_t *slot, *oldest;
+	const char *name, *base;
+	int i;
+
+	name = ( ch->name[0] && ch->is_sentence ) ? ch->name : ( ch->sfx ? ch->sfx->name : "" );
+	base = Q_strrchr( name, '/' );
+	base = base ? base + 1 : name;
+
+	oldest = &g_espSounds[0];
+	for( i = 0; i < ESP_SOUND_MARKS; i++ )
+	{
+		slot = &g_espSounds[i];
+		if( slot->time > 0.0 && slot->entnum == ch->entnum && slot->chan == ch->entchannel
+			&& !Q_strncmp( slot->name, base, sizeof( slot->name )))
+		{
+			VectorCopy( origin, slot->origin );
+			slot->time = host.realtime;
+			slot->vol = vol;
+			return;
+		}
+		if( slot->time < oldest->time )
+			oldest = slot;
+	}
+
+	memset( oldest, 0, sizeof( *oldest ));
+	VectorCopy( origin, oldest->origin );
+	oldest->time = host.realtime;
+	oldest->entnum = ch->entnum;
+	oldest->chan = ch->entchannel;
+	oldest->vol = vol;
+	Q_strncpy( oldest->name, base, sizeof( oldest->name ));
+}
+
+/* Debug markers for sounds the mixer is playing. Listen server only. */
+static void ESP_DrawSounds( void )
+{
+	static convar_t *cv;
+	rgba_t hud = { 255, 220, 80, 255 };
+	rgba_t dim = { 160, 160, 160, 255 };
+	int i, shown;
+
+	if( !cv )
+		cv = Cvar_FindVar( "esp_sound" );
+	if( !cv || cv->value <= 0.0f )
+	{
+		ESP_SoundClear();
+		return;
+	}
+
+	if( cls.state != ca_active || !dma.initialized || !ESP_OfflineSession() )
+	{
+		ESP_SoundClear();
+		if( cls.state == ca_active )
+			Con_DrawString( 8, 48, "esp_sound: offline listen server only", hud );
+		return;
+	}
+
+	for( i = NUM_AMBIENTS; i < total_channels; i++ )
+	{
+		channel_t *ch = &channels[i];
+		vec3_t origin;
+		int vol;
+
+		if( !ch->sfx || ch->localsound )
+			continue;
+		/* 1 = entity sounds (steps, shots, voice). 2 = also world/static. */
+		if( cv->value < 2.0f && ( ch->staticsound || ch->entnum <= 0 ))
+			continue;
+		if( !ESP_SoundOrigin( ch, origin ))
+			continue;
+
+		vol = Q_max( ch->leftvol, ch->rightvol );
+		ESP_SoundNote( ch, origin, vol );
+	}
+
+	shown = 0;
+	for( i = 0; i < ESP_SOUND_MARKS; i++ )
+	{
+		esp_sound_mark_t *mark = &g_espSounds[i];
+		vec3_t screen;
+		char msg[96];
+
+		if( mark->time <= 0.0 || ( host.realtime - mark->time ) > ESP_SOUND_LINGER )
+			continue;
+		if( ref.dllFuncs.WorldToScreen( mark->origin, screen ))
+			continue;
+
+		screen[0] =  0.5f * screen[0] * refState.width;
+		screen[1] = -0.5f * screen[1] * refState.height;
+		screen[0] += 0.5f * refState.width;
+		screen[1] += 0.5f * refState.height;
+
+		Q_snprintf( msg, sizeof( msg ), "%s\nent %d vol %d", mark->name, mark->entnum, mark->vol );
+		if( mark->vol > 0 )
+			Con_DrawString( (int)screen[0], (int)screen[1], msg, hud );
+		else
+			Con_DrawString( (int)screen[0], (int)screen[1], msg, dim );
+		shown++;
+	}
+
+	{
+		char msg[32];
+
+		Q_snprintf( msg, sizeof( msg ), "esp_sound %d", shown );
+		Con_DrawString( 8, 48, msg, hud );
+	}
+}
+
 /*
 ==================
 V_PostRender
@@ -774,6 +932,7 @@ void V_PostRender( void )
 		SCR_NetSpeeds();
 		SCR_DrawPos();
 		SCR_DrawEnts();
+		ESP_DrawSounds();
 		SCR_DrawNetGraph();
 		SCR_DrawUserCmd();
 		SV_DrawOrthoTriangles();
