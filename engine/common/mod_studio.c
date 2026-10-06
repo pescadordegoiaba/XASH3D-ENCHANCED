@@ -667,11 +667,33 @@ StudioBoundVertex
 */
 static void Mod_StudioBoundVertex( vec3_t mins, vec3_t maxs, int *numverts, const vec3_t vertex )
 {
+	if( !vertex )
+		return;
+
 	if((*numverts) == 0 )
 		ClearBounds( mins, maxs );
 
 	AddPointToBounds( vertex, mins, maxs );
 	(*numverts)++;
+}
+
+// offset+count*elem must stay inside the loaded studio buffer
+static qboolean Mod_StudioRangeOk( int offset, int count, int elem, int length )
+{
+	size_t end;
+
+	if( offset < 0 || count < 0 || elem <= 0 || length <= 0 )
+		return false;
+	if( count > ( 1 << 20 ))
+		return false;
+	if( (size_t)offset > (size_t)length )
+		return false;
+
+	end = (size_t)offset + (size_t)count * (size_t)elem;
+	if( end < (size_t)offset || end > (size_t)length )
+		return false;
+
+	return true;
 }
 
 /*
@@ -703,9 +725,9 @@ static void Mod_StudioAccumulateBoneVerts( vec3_t mins, vec3_t maxs, int *numver
 StudioComputeBounds
 ====================
 */
-static void Mod_StudioComputeBounds( void *buffer, vec3_t mins, vec3_t maxs, qboolean ignore_sequences )
+static qboolean Mod_StudioComputeBounds( void *buffer, int length, vec3_t mins, vec3_t maxs, qboolean ignore_sequences )
 {
-	int		i, j, k, numseq;
+	int		i, j, k, m, numseq;
 	studiohdr_t	*pstudiohdr;
 	mstudiobodyparts_t	*pbodypart;
 	mstudiomodel_t	*m_pSubModel;
@@ -716,7 +738,6 @@ static void Mod_StudioComputeBounds( void *buffer, vec3_t mins, vec3_t maxs, qbo
 	vec3_t		bone_mins, bone_maxs;
 	vec3_t		vert_mins, vert_maxs;
 	int		vert_count, bone_count;
-	int		bodyCount = 0;
 	vec3_t		pos, *pverts;
 
 	vert_count = bone_count = 0;
@@ -724,54 +745,90 @@ static void Mod_StudioComputeBounds( void *buffer, vec3_t mins, vec3_t maxs, qbo
 	VectorClear( bone_maxs );
 	VectorClear( vert_mins );
 	VectorClear( vert_maxs );
+	ClearBounds( mins, maxs );
 
-	// Get the body part portion of the model
 	pstudiohdr = (studiohdr_t *)buffer;
+	if( !pstudiohdr || length < (int)sizeof( studiohdr_t ))
+		return false;
+	if( pstudiohdr->numbodyparts <= 0 || pstudiohdr->numbodyparts > 64 )
+		return false;
+	if( !Mod_StudioRangeOk( pstudiohdr->bodypartindex, pstudiohdr->numbodyparts, sizeof( mstudiobodyparts_t ), length ))
+		return false;
+
 	pbodypart = (mstudiobodyparts_t *)((byte *)pstudiohdr + pstudiohdr->bodypartindex);
 
-	// each body part has nummodels variations so there are as many total variations as there
-	// are in a matrix of each part by each other part
+	// Follow each bodypart's modelindex. Models are not always packed
+	// immediately after the bodypart table; a bad index used to walk off
+	// the file and crash in AddPointToBounds.
 	for( i = 0; i < pstudiohdr->numbodyparts; i++ )
-		bodyCount += pbodypart[i].nummodels;
-
-	// The studio models we want are vec3_t mins, vec3_t maxsight after the bodyparts (still need to
-	// find a detailed breakdown of the mdl format).  Move pointer there.
-	m_pSubModel = (mstudiomodel_t *)(&pbodypart[pstudiohdr->numbodyparts]);
-
-	for( i = 0; i < bodyCount; i++ )
 	{
-		pverts = (vec3_t *)((byte *)pstudiohdr + m_pSubModel[i].vertindex);
+		int nmodels = pbodypart[i].nummodels;
 
-		for( j = 0; j < m_pSubModel[i].numverts; j++ )
-			Mod_StudioBoundVertex( bone_mins, bone_maxs, &vert_count, pverts[j] );
-	}
+		if( nmodels <= 0 )
+			continue;
+		if( !Mod_StudioRangeOk( pbodypart[i].modelindex, nmodels, sizeof( mstudiomodel_t ), length ))
+			break;
 
-	pbones = (mstudiobone_t *)((byte *)pstudiohdr + pstudiohdr->boneindex);
-	numseq = (ignore_sequences) ? 1 : pstudiohdr->numseq;
+		m_pSubModel = (mstudiomodel_t *)((byte *)pstudiohdr + pbodypart[i].modelindex);
 
-	for( i = 0; i < numseq; i++ )
-	{
-		pseqdesc = (mstudioseqdesc_t *)((byte *)pstudiohdr + pstudiohdr->seqindex) + i;
-		pseqgroup = (mstudioseqgroup_t *)((byte *)pstudiohdr + pstudiohdr->seqgroupindex) + pseqdesc->seqgroup;
-
-		if( pseqdesc->seqgroup == 0 )
-			panim = (mstudioanim_t *)((byte *)pstudiohdr + pseqdesc->animindex);
-		else continue;
-
-		for( j = 0; j < pstudiohdr->numbones; j++ )
+		for( m = 0; m < nmodels; m++ )
 		{
-			for( k = 0; k < pseqdesc->numframes; k++ )
-			{
-				R_StudioCalcBones( k, 0, &pbones[j], panim, NULL, pos, NULL );
-				Mod_StudioBoundVertex( vert_mins, vert_maxs, &bone_count, pos );
-			}
-		}
+			if( m_pSubModel[m].numverts <= 0 )
+				continue;
+			if( !Mod_StudioRangeOk( m_pSubModel[m].vertindex, m_pSubModel[m].numverts, sizeof( vec3_t ), length ))
+				continue;
 
-		Mod_StudioAccumulateBoneVerts( bone_mins, bone_maxs, &vert_count, vert_mins, vert_maxs, &bone_count );
+			pverts = (vec3_t *)((byte *)pstudiohdr + m_pSubModel[m].vertindex);
+
+			for( j = 0; j < m_pSubModel[m].numverts; j++ )
+				Mod_StudioBoundVertex( bone_mins, bone_maxs, &vert_count, pverts[j] );
+		}
 	}
+
+	numseq = ignore_sequences ? 1 : pstudiohdr->numseq;
+	if( numseq > 0 && pstudiohdr->numbones > 0 && pstudiohdr->numbones <= MAXSTUDIOBONES &&
+		Mod_StudioRangeOk( pstudiohdr->boneindex, pstudiohdr->numbones, sizeof( mstudiobone_t ), length ) &&
+		Mod_StudioRangeOk( pstudiohdr->seqindex, numseq, sizeof( mstudioseqdesc_t ), length ))
+	{
+		pbones = (mstudiobone_t *)((byte *)pstudiohdr + pstudiohdr->boneindex);
+
+		for( i = 0; i < numseq; i++ )
+		{
+			pseqdesc = (mstudioseqdesc_t *)((byte *)pstudiohdr + pstudiohdr->seqindex) + i;
+
+			if( pseqdesc->seqgroup != 0 )
+				continue;
+			if( pseqdesc->animindex < 0 || pseqdesc->animindex >= length )
+				continue;
+			if( pseqdesc->numframes <= 0 || pseqdesc->numframes > 4096 )
+				continue;
+			if( pstudiohdr->seqgroupindex < 0 ||
+				!Mod_StudioRangeOk( pstudiohdr->seqgroupindex, pseqdesc->seqgroup + 1, sizeof( mstudioseqgroup_t ), length ))
+				continue;
+
+			pseqgroup = (mstudioseqgroup_t *)((byte *)pstudiohdr + pstudiohdr->seqgroupindex) + pseqdesc->seqgroup;
+			(void)pseqgroup;
+			panim = (mstudioanim_t *)((byte *)pstudiohdr + pseqdesc->animindex);
+
+			for( j = 0; j < pstudiohdr->numbones; j++ )
+			{
+				for( k = 0; k < pseqdesc->numframes; k++ )
+				{
+					R_StudioCalcBones( k, 0, &pbones[j], panim, NULL, pos, NULL );
+					Mod_StudioBoundVertex( vert_mins, vert_maxs, &bone_count, pos );
+				}
+			}
+
+			Mod_StudioAccumulateBoneVerts( bone_mins, bone_maxs, &vert_count, vert_mins, vert_maxs, &bone_count );
+		}
+	}
+
+	if( vert_count <= 0 )
+		return false;
 
 	VectorCopy( bone_mins, mins );
 	VectorCopy( bone_maxs, maxs );
+	return true;
 }
 
 /*
@@ -783,20 +840,17 @@ qboolean Mod_GetStudioBounds( const char *name, vec3_t mins, vec3_t maxs )
 {
 	int	result = false;
 	byte	*f;
+	fs_offset_t	size = 0;
 
 	if( !Q_strstr( name, "models" ) || !Q_strstr( name, ".mdl" ))
 		return false;
 
-	f = FS_LoadFile( name, NULL, false );
+	f = FS_LoadFile( name, &size, false );
 	if( !f ) return false;
 
-	if( *(uint *)f == IDSTUDIOHEADER )
-	{
-		VectorClear( mins );
-		VectorClear( maxs );
-		Mod_StudioComputeBounds( f, mins, maxs, false );
-		result = true;
-	}
+	if( size > 0 && size <= 0x7fffffff && *(uint *)f == IDSTUDIOHEADER )
+		result = Mod_StudioComputeBounds( f, (int)size, mins, maxs, false );
+
 	Mem_Free( f );
 
 	return result;
@@ -980,12 +1034,18 @@ void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded )
 		VectorCopy( phdr->min, mod->mins );
 		VectorCopy( phdr->max, mod->maxs );
 	}
-	else
+	else if( Mod_StudioComputeBounds( phdr, phdr->length, mod->mins, mod->maxs, true ))
 	{
 		// well compute bounds from vertices and round to nearest even values
-		Mod_StudioComputeBounds( phdr, mod->mins, mod->maxs, true );
 		RoundUpHullSize( mod->mins );
 		RoundUpHullSize( mod->maxs );
+	}
+	else
+	{
+		// Corrupt or unusual mdl (bad vertindex). Keep the model, use a small hull.
+		Con_Printf( S_WARN "%s: %s has invalid studio bounds, using default hull\n", __func__, mod->name );
+		VectorSet( mod->mins, -16.0f, -16.0f, -16.0f );
+		VectorSet( mod->maxs, 16.0f, 16.0f, 16.0f );
 	}
 
 	mod->numframes = Mod_StudioBodyVariations( mod );

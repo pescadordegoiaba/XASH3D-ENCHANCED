@@ -70,6 +70,7 @@ static CVAR_DEFINE_AUTO( cl_backspeed, "400", FCVAR_ARCHIVE | FCVAR_CLIENTDLL | 
 static CVAR_DEFINE_AUTO( cl_sidespeed, "400", FCVAR_ARCHIVE | FCVAR_CLIENTDLL | FCVAR_FILTERABLE, "side speed" );
 static CVAR_DEFINE_AUTO( m_grab_debug, "1", FCVAR_PRIVILEGED, "grab debug" );
 static CVAR_DEFINE_AUTO( evdev_cursor_speed, "1", FCVAR_ARCHIVE, "cursor pixels per raw /dev/input count" );
+static CVAR_DEFINE_AUTO( cl_imgui_mouse, "0", FCVAR_CLIENTDLL, "client imgui wants an absolute cursor" );
 CVAR_DEFINE_AUTO( touch_enable, DEFAULT_TOUCH_ENABLE, FCVAR_ARCHIVE | FCVAR_FILTERABLE, "touch" );
 
 //=============================================================================
@@ -376,6 +377,8 @@ static void EVDev_MoveCursor( float dx, float dy )
 
 static qboolean EVDev_WantCursor( void )
 {
+	if( cl_imgui_mouse.value != 0.0f && cls.key_dest == key_game )
+		return true;
 	if( host.mouse_visible )
 		return true;
 	if( cls.key_dest == key_menu || cls.key_dest == key_console )
@@ -563,6 +566,7 @@ static void IN_StartupMouse( void )
 	Cvar_RegisterVariable( &m_rawinput );
 	Cvar_RegisterVariable( &m_grab_debug );
 	Cvar_RegisterVariable( &evdev_cursor_speed );
+	Cvar_RegisterVariable( &cl_imgui_mouse );
 	Cvar_RegisterVariable( &touch_enable );
 
 	if( Sys_CheckParm( "-noenginemouse" ))
@@ -587,6 +591,25 @@ void IN_MouseRestorePos( void )
 	if( !in_mouse_savedpos ) return;
 	Platform_SetMousePos( in_lastvalidpos.x, in_lastvalidpos.y );
 	in_mouse_savedpos = false;
+}
+
+static void IN_ApplyImGuiCursor( void )
+{
+	static int applied = 0;
+	int want;
+
+	if( cls.key_dest != key_game )
+	{
+		applied = 0;
+		return;
+	}
+
+	want = cl_imgui_mouse.value != 0.0f;
+	if( want != applied )
+	{
+		applied = want;
+		Platform_SetCursorType( want ? dc_arrow : dc_none );
+	}
 }
 
 void IN_ToggleClientMouse( int newstate, int oldstate )
@@ -711,10 +734,15 @@ void IN_MouseEvent( int key, int down )
 		Touch_KeyEvent( K_MOUSE1 + key, down );
 	else if( cls.key_dest == key_game )
 	{
-		VGui_MouseEvent( K_MOUSE1 + key, down );
-		// Cursor mode (buy menu, spectator mouse) must not also fire +attack.
-		if( in_mouseactive && !host.mouse_visible && clgame.dllFuncs.IN_MouseEvent )
-			clgame.dllFuncs.IN_MouseEvent( in_mstate );
+		if( cl_imgui_mouse.value != 0.0f )
+			Key_Event( K_MOUSE1 + key, down );
+		else
+		{
+			VGui_MouseEvent( K_MOUSE1 + key, down );
+			// Cursor mode (buy menu, spectator mouse) must not also fire +attack.
+			if( in_mouseactive && !host.mouse_visible && clgame.dllFuncs.IN_MouseEvent )
+				clgame.dllFuncs.IN_MouseEvent( in_mstate );
+		}
 	}
 	else
 		Key_Event( K_MOUSE1 + key, down );
@@ -868,6 +896,7 @@ static void IN_Commands( void )
 	if( !in_mouseinitialized )
 		return;
 
+	IN_ApplyImGuiCursor();
 	IN_CheckMouseState( in_mouseactive );
 #if XASH_USE_EVDEV
 	EVDev_Publish();
