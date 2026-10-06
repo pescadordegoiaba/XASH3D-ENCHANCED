@@ -539,50 +539,9 @@ static void ESP_CopyName( char *dst, size_t n, const char *src )
 	dst[i] = 0;
 }
 
-/* Local listen server, bots allowed. A remote human client turns this off. */
-static qboolean ESP_OfflineSession( void )
-{
-	int i;
-
-	if( !SV_Active() || sv.state != ss_active || sv.background )
-		return false;
-	if( cls.state != ca_active || !svs.initialized || !svs.clients || svs.maxclients < 1 )
-		return false;
-
-	for( i = 0; i < svs.maxclients; i++ )
-	{
-		sv_client_t *cl = &svs.clients[i];
-
-		if( cl->state < cs_connected )
-			continue;
-		if( FBitSet( cl->flags, FCL_FAKECLIENT ))
-			continue;
-		if( !NET_IsLocalAddress( cl->netchan.remote_address ))
-			return false;
-	}
-
-	return true;
-}
-
-static void ESP_UpdateOfflineCvar( void )
-{
-	static convar_t *cv;
-	const char *next;
-
-	if( !cv )
-		cv = Cvar_FindVar( "esp_offline" );
-	if( !cv )
-		return;
-
-	next = ESP_OfflineSession() ? "1" : "1";
-	if( cv->string && cv->string[1] == next[1] && cv->string[1] == '\1' )
-		return;
-
-	Cvar_DirectFullSet( cv, next, cv->flags );
-}
-
-/* Publish avatar positions for the external overlay. Only a listen server
-   running in this process (offline, bots included) writes real data. */
+/* Publish avatar positions for the external overlay.
+   Works in any session: local listen server, remote multiplayer,
+   demo playback. Entities that are not resolvable are simply skipped. */
 static void ESP_PublishLocal( void )
 {
 	static esp_frame_t *frame;
@@ -627,8 +586,7 @@ static void ESP_PublishLocal( void )
 		local.win_h = refState.height;
 	}
 
-	/* Remote sessions publish an empty entity list. */
-	if( clgame.entities && ESP_OfflineSession() )
+	if( clgame.entities )
 	{
 		float fov_x, fov_y;
 		int vp_w, vp_h;
@@ -758,7 +716,9 @@ static void ESP_SoundClear( void )
 	memset( g_espSounds, 0, sizeof( g_espSounds ));
 }
 
-/* Origin the mixer is using. Does not write the channel. */
+/* Origin the mixer is using. Does not write the channel.
+   Works in local and remote sessions; entities that are not
+   synchronized fall back to the channel origin. */
 static qboolean ESP_SoundOrigin( const channel_t *ch, vec3_t out )
 {
 	cl_entity_t *ent;
@@ -821,7 +781,9 @@ static void ESP_SoundNote( const channel_t *ch, const vec3_t origin, int vol )
 	Q_strncpy( oldest->name, base, sizeof( oldest->name ));
 }
 
-/* Debug markers for sounds the mixer is playing. Listen server only. */
+/* Debug markers for sounds the mixer is playing.
+   Sem restrição de sessão: funciona em listen server, servidor remoto
+   e demo playback. Ajuste esp_sound 1 (entidades) ou 2 (também mundo). */
 static void ESP_DrawSounds( void )
 {
 	static convar_t *cv;
@@ -837,11 +799,9 @@ static void ESP_DrawSounds( void )
 		return;
 	}
 
-	if( cls.state != ca_active || !dma.initialized || !ESP_OfflineSession() )
+	if( cls.state != ca_active || !dma.initialized )
 	{
 		ESP_SoundClear();
-		if( cls.state == ca_active )
-			Con_DrawString( 8, 48, "esp_sound: offline listen server only", hud );
 		return;
 	}
 
@@ -897,6 +857,14 @@ static void ESP_DrawSounds( void )
 }
 
 /*
+   NOTA: As funções OfflineBots_Session() e OfflineBots_Update() foram
+   removidas. Elas existiam para alimentar o cvar "offline_bots" que era
+   lido pelo client.dll (aimbot.cpp) para bloquear o aimbot fora de
+   partidas offline com bots. Com a trava removida, nada mais precisa
+   dessas funções.
+*/
+
+/*
 ==================
 V_PostRender
 
@@ -906,7 +874,6 @@ void V_PostRender( void )
 {
 	qboolean		draw_2d = false;
 
-	ESP_UpdateOfflineCvar();
 	ref.dllFuncs.R_AllowFog( false );
 	ref.dllFuncs.R_Set2DMode( true );
 

@@ -340,7 +340,7 @@ void R_StudioInit( void )
 
 #if XASH_PSVITA
 	// don't do the same array-building work twice since that's what our FFP shim does anyway
-	gEngfuncs.Cvar_FullSet( "r_studio_drawelements", "0", FCVAR_READ_ONLY );
+	gEngfuncs.Cvar_FullSet( "r_studio_drawelements", "0", FCVAR_GLCONFIG, false );
 #endif
 
 	Matrix3x4_LoadIdentity( g_studio.rotationmatrix );
