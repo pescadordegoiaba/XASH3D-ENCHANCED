@@ -446,7 +446,9 @@ net_gai_state_t NET_StringToSockaddr( const char *s, struct sockaddr_storage *sa
 				return NET_EAI_AGAIN;
 			}
 
-			if( !Q_strcmp( copy, nsthread.hostname ))
+			// An empty name compares equal to a cleared hostname and detaches a
+			// thread that was never created, or detaches the same thread twice.
+			if( copy[0] && nsthread.thread && !Q_strcmp( copy, nsthread.hostname ))
 			{
 				ret = nsthread.result;
 
@@ -456,6 +458,7 @@ net_gai_state_t NET_StringToSockaddr( const char *s, struct sockaddr_storage *sa
 				memset( &nsthread.addr, 0, sizeof( nsthread.addr ));
 
 				detach_thread( nsthread.thread );
+				nsthread.thread = (thread_t)0;
 				asyncfailed = false;
 			}
 			else
@@ -472,6 +475,8 @@ net_gai_state_t NET_StringToSockaddr( const char *s, struct sockaddr_storage *sa
 				}
 
 				Con_Reportf( S_ERROR "%s: failed to create thread!\n", __func__ );
+				nsthread.thread = (thread_t)0;
+				nsthread.hostname[0] = '\0';
 				nsthread.busy = false;
 			}
 
